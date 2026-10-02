@@ -74,18 +74,22 @@ Open **http://localhost:7692** in your browser and sign in. Go to **Settings** t
 
 ## Connect the OpenCode Plugin
 
-Add the local plugin to your OpenCode configuration (`~/.config/opencode/opencode.json` or `opencode.jsonc`):
+Add the plugin to your OpenCode configuration (`~/.config/opencode/opencode.json` or `opencode.jsonc`):
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "/absolute/path/to/opencode-observatory/packages/plugin"
+    // Pre-compiled directly from GitHub (recommended: no cloning or build steps needed)
+    "github:chrisb09/opencode-observatory"
+
+    // Or via local checkout:
+    // "/path/to/opencode-observatory"
   ]
 }
 ```
 
-Restart OpenCode once so the plugin is loaded into the session.
+Restart OpenCode once so the plugin is loaded into your session.
 
 ### Option A: Configure Directly Inside OpenCode (No Terminal Commands)
 Once the plugin is added, you can configure it directly inside your chat session with OpenCode:
@@ -96,9 +100,13 @@ Simply instruct the assistant:
 The assistant uses the built-in `observatory_setup` tool to validate the server URL, verify your API key, save local configuration, and start live telemetry immediately without leaving your session.
 
 ### Option B: Configure via Terminal CLI
-Alternatively, run the interactive terminal setup:
+Alternatively, run the interactive terminal setup without cloning:
 
 ```sh
+# Directly via GitHub reference
+bun x github:chrisb09/opencode-observatory setup
+
+# Or from local repository clone
 bun packages/plugin/dist/cli.js setup
 ```
 
@@ -108,10 +116,10 @@ To remove or reset a prior configuration:
 
 ```sh
 # Remove client configuration (server URL and API key)
-bun packages/plugin/dist/cli.js clear
+bun x github:chrisb09/opencode-observatory clear
 
 # Remove client configuration and delete the local SQLite outbox database
-bun packages/plugin/dist/cli.js clear --all
+bun x github:chrisb09/opencode-observatory clear --all
 ```
 
 ---

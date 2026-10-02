@@ -2,6 +2,21 @@
   "name": "opencode-observatory",
   "private": true,
   "type": "module",
+  "main": "./packages/plugin/dist/index.js",
+  "types": "./packages/plugin/dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./packages/plugin/dist/index.d.ts",
+      "default": "./packages/plugin/dist/index.js"
+    },
+    "./plugin": {
+      "types": "./packages/plugin/dist/index.d.ts",
+      "default": "./packages/plugin/dist/index.js"
+    }
+  },
+  "bin": {
+    "opencode-observatory": "./packages/plugin/dist/cli.js"
+  },
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -20,6 +35,9 @@
     "setup:env": "bun scripts/init-env.ts",
     "plugin:setup": "bun packages/plugin/src/cli.ts setup",
     "plugin:import": "bun packages/plugin/src/cli.ts import"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.34"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",
