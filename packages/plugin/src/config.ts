@@ -1,10 +1,20 @@
 import { homedir, hostname, userInfo } from "node:os";
 import { join } from "node:path";
-import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
+import { mkdir, readFile, writeFile, chmod, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 export const configDir = () => join(process.env.XDG_CONFIG_HOME ?? join(homedir(),".config"),"opencode-observatory");
 export const stateDir = () => join(process.env.XDG_DATA_HOME ?? join(homedir(),".local","share"),"opencode-observatory");
+export async function clearConfig(options: { data?: boolean } = {}) {
+  try {
+    await rm(join(configDir(), "config.json"), { force: true });
+  } catch {}
+  if (options.data) {
+    try {
+      await rm(stateDir(), { recursive: true, force: true });
+    } catch {}
+  }
+}
 const ConfigSchema=z.object({
   schemaVersion:z.number().int().optional(),
   url:z.string().url(),apiKey:z.string().min(10),fingerprintSecret:z.string().min(20),userId:z.string().uuid(),installationId:z.string().uuid(),

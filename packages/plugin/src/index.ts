@@ -1,5 +1,5 @@
 import { type Plugin,type Hooks,tool } from "@opencode-ai/plugin";
-import { loadConfig,api,configureObservatory } from "./config.js";
+import { loadConfig,api,configureObservatory,clearConfig } from "./config.js";
 import { inventory,detectVersion,syncLocalAccounts } from "./runtime.js";
 import { Collector,fingerprint } from "./metadata.js";
 import { Outbox } from "./outbox.js";
@@ -37,14 +37,25 @@ const plugin:Plugin=async ctx=>{
 
   const tools:NonNullable<Hooks["tool"]>={
     observatory_setup:tool({
-      description:"Configure or connect OpenCode Observatory telemetry collector with the server URL and API key. If the user asks to connect or configure Observatory without an API key, ask them for their Observatory URL (defaults to http://localhost:7692) and telemetry API key from the Observatory Settings page.",
+      description:"Configure, connect, or clear OpenCode Observatory telemetry. To connect, provide apiKey (and optional url). To disconnect or remove the configuration, pass clear: true.",
       args:{
-        apiKey:tool.schema.string().describe("Observatory telemetry API key (starts with 'obs_') created in the Observatory Settings page"),
-        url:tool.schema.string().optional().describe("Observatory server URL (e.g. http://localhost:7692 or your LAN address). Defaults to http://localhost:7692 if omitted"),
-        autoImport:tool.schema.boolean().optional().describe("Whether to automatically import historical sessions (default: true)"),
+        apiKey:tool.schema.string().optional().describe("Observatory telemetry API key (starts with 'obs_') created in Observatory Settings"),
+        url:tool.schema.string().optional().describe("Observatory server URL (defaults to http://localhost:7692)"),
+        autoImport:tool.schema.boolean().optional().describe("Whether to import past sessions automatically (default: true)"),
+        clear:tool.schema.boolean().optional().describe("Set to true to disconnect Observatory and delete the local configuration"),
+        clearData:tool.schema.boolean().optional().describe("When clear is true, also delete the local SQLite outbox database"),
       },
       async execute(args){
         try{
+          if(args.clear){
+            await clearConfig({data:args.clearData});
+            if(outbox){try{await outbox.close();}catch{}}
+            outbox=null;collector=null;config=null;
+            return `OpenCode Observatory configuration removed.${args.clearData?" Local outbox database also cleared.":""} Telemetry is now stopped.`;
+          }
+          if(!args.apiKey){
+            return "Please provide your Observatory telemetry API key (starts with 'obs_') to connect, or pass clear: true to remove the current configuration.";
+          }
           const result=await configureObservatory({url:args.url,apiKey:args.apiKey,autoImport:args.autoImport,fetcher:registry.original});
           startTelemetry(result.config);
           return result.message;

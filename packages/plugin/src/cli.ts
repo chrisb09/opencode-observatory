@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
 import { stdin,stdout } from "node:process";
-import { loadConfig,saveConfig,defaultIdentity,api,configureObservatory } from "./config.js";
+import { loadConfig,saveConfig,defaultIdentity,api,configureObservatory,clearConfig } from "./config.js";
 import { Outbox } from "./outbox.js";
 import { Collector } from "./metadata.js";
 import { inventory,detectVersion } from "./runtime.js";
@@ -9,7 +9,12 @@ import { importHistory } from "./history.js";
 const command=process.argv[2]??"status";
 try{
   let config=await loadConfig();
-  if(command==="setup"){
+  if(command==="clear"||command==="reset"){
+    const all=process.argv.includes("--all")||process.argv.includes("--data");
+    await clearConfig({data:all});
+    console.log(`Cleared Observatory configuration${all?" and local outbox database":" (run with --all to also delete local outbox database)"}.`);
+    console.log("Run 'opencode-observatory setup' or use the in-session 'observatory_setup' tool to reconnect.");
+  }else if(command==="setup"){
     const rl=createInterface({input:stdin,output:stdout});
     try{
       const rawUrl=process.env.OBSERVATORY_URL??((await rl.question(`Server URL [${config?.url??"http://localhost:7692"}]: `))||config?.url||"http://localhost:7692");
@@ -35,7 +40,7 @@ try{
       else if(command==="replay"){outbox.replay();console.log("All retained metadata is pending again. Run flush to replay it.");}
       else if(command==="status")console.log(JSON.stringify(outbox.health(),null,2));
       else if(command==="mcp-config")console.log(JSON.stringify({$schema:"https://opencode.ai/config.json",mcp:{observatory:{type:"remote",url:`${config.url.replace(/\/$/,"")}/mcp`,oauth:false,headers:{Authorization:"Bearer {env:OBSERVATORY_API_KEY}"}}}},null,2));
-      else throw new Error("Commands: setup, status, import [--all] [--database PATH], flush, replay, mcp-config");
+      else throw new Error("Commands: setup, clear [--all], status, import [--all] [--database PATH], flush, replay, mcp-config");
     }finally{await outbox.close();}
   }
 }catch(error){console.error(error instanceof Error?error.message:"Operation failed");process.exitCode=1;}

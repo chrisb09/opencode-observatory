@@ -99,10 +99,21 @@ test("configureObservatory and in-session observatory_setup tool configure and a
     expect(typeof setupOutput === "string" ? setupOutput : (setupOutput as any).output).toContain("connected successfully");
     const statusOutput = await hooks.tool!.observatory_status.execute({}, {} as any);
     expect(typeof statusOutput === "string" ? statusOutput : (statusOutput as any).output).toContain("pending");
+
+    // Test clearing via tool
+    const clearOutput = await hooks.tool!.observatory_setup.execute({ clear: true }, {} as any);
+    expect(typeof clearOutput === "string" ? clearOutput : (clearOutput as any).output).toContain("configuration removed");
+    const statusAfterClear = await hooks.tool!.observatory_status.execute({}, {} as any);
+    expect(typeof statusAfterClear === "string" ? statusAfterClear : (statusAfterClear as any).output).toContain("not configured");
+
     await hooks.dispose?.();
   } finally {
     globalThis.fetch = origFetch;
   }
+
+  const { loadConfig, clearConfig } = await import("../packages/plugin/src/config.js");
+  expect(await loadConfig()).toBeNull();
+  await clearConfig({ data: true });
 
   process.env.XDG_CONFIG_HOME=origXdg;
   await rm(dir,{recursive:true,force:true});

@@ -104,6 +104,16 @@ bun packages/plugin/dist/cli.js setup
 
 Enter your Observatory server URL (default `http://localhost:7692`) and your `obs_...` telemetry API key.
 
+To remove or reset a prior configuration:
+
+```sh
+# Remove client configuration (server URL and API key)
+bun packages/plugin/dist/cli.js clear
+
+# Remove client configuration and delete the local SQLite outbox database
+bun packages/plugin/dist/cli.js clear --all
+```
+
 ---
 
 ## Query Statistics Inside OpenCode
@@ -112,7 +122,7 @@ Enter your Observatory server URL (default `http://localhost:7692`) and your `ob
 When configured with a read-capable key, the plugin exposes tools directly in OpenCode:
 - `observatory_status`: Check local outbox delivery health and pending queue counts.
 - `observatory_usage`: Query centralized usage, model breakdowns, and token statistics across any timeframe.
-- `observatory_setup`: Inspect or update your Observatory connection on the fly.
+- `observatory_setup`: Connect, update, or disconnect (with `clear: true`) your Observatory connection on the fly.
 
 ### Model Context Protocol (MCP) Server
 To expose the full read-only analytics suite as MCP tools to OpenCode or Claude Desktop, generate your configuration:
