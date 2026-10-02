@@ -35,7 +35,8 @@
     "setup:admin": "node --env-file=.env --import tsx apps/server/src/admin.ts",
     "setup:env": "bun scripts/init-env.ts",
     "plugin:setup": "bun packages/plugin/src/cli.ts setup",
-    "plugin:import": "bun packages/plugin/src/cli.ts import"
+    "plugin:import": "bun packages/plugin/src/cli.ts import",
+    "plugin:pack": "npm pack -w opencode-observatory-plugin"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.34"

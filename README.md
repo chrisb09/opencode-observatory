@@ -80,10 +80,13 @@ Add the plugin to your OpenCode configuration (`~/.config/opencode/opencode.json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    // Pre-compiled directly from GitHub (recommended: no cloning or build steps needed)
-    "github:chrisb09/opencode-observatory"
+    // Option 1: Directly via GitHub reference (pinned release tag or rolling main)
+    "github:chrisb09/opencode-observatory#v0.1.0"
 
-    // Or via local checkout:
+    // Option 2: Standalone pre-packaged release tarball (~89 KB, fastest install)
+    // "https://github.com/chrisb09/opencode-observatory/releases/download/v0.1.0/opencode-observatory-plugin-0.1.0.tgz"
+
+    // Option 3: Local repository clone
     // "/path/to/opencode-observatory"
   ]
 }
@@ -103,10 +106,13 @@ The assistant uses the built-in `observatory_setup` tool to validate the server 
 Alternatively, run the interactive terminal setup without cloning:
 
 ```sh
-# Directly via GitHub reference
+# Via GitHub reference:
 bun x github:chrisb09/opencode-observatory setup
 
-# Or from local repository clone
+# Or via release tarball:
+npx https://github.com/chrisb09/opencode-observatory/releases/download/v0.1.0/opencode-observatory-plugin-0.1.0.tgz setup
+
+# Or from local repository clone:
 bun packages/plugin/dist/cli.js setup
 ```
 

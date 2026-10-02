@@ -7,6 +7,7 @@ apps/**/dist/
 packages/contracts/dist/
 dist/
 *.tsbuildinfo
+*.tgz
 !packages/plugin/dist/
 
 # Environment & secrets
