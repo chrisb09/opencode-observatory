@@ -1,0 +1,6 @@
+import { randomUUID } from "node:crypto";
+import type {Runtime,TelemetryEvent} from "@observatory/contracts";
+import type {ClientConfig} from "../packages/plugin/src/config.js";
+export const runtime:Runtime={opencode:"1.18.34",collector:"0.1.0",plugins:[{spec:"example@1.2.3",name:"example",version:"1.2.3",source:"resolved"}],capturedAt:1700000000000,provenance:"capture"};
+export const config:ClientConfig={url:"http://127.0.0.1:7692",apiKey:"obs_test_fake_key",fingerprintSecret:"test-fingerprint-secret-not-real",userId:randomUUID(),installationId:randomUUID(),machine:"tester@fixture",autoImport:false,enableTools:true,accounts:{}};
+export function event(overrides:Partial<TelemetryEvent>={}):TelemetryEvent{return {schemaVersion:1,eventId:randomUUID(),installationId:config.installationId,instanceId:randomUUID(),machine:config.machine,projectId:"prj_test",sessionId:"ses_test",messageId:"msg_test",kind:"step",entityId:randomUUID(),observedAt:1700000000000,revision:1700000000010,historical:false,runtime,data:{provider:"openai",model:"test-model",inputTokens:100,outputTokens:20,reasoningTokens:4,cacheReadTokens:40,cacheWriteTokens:0,cost:0.001,costSource:"opencode-estimate",usageSource:"opencode",usageSemantics:"opencode-exclusive-input",status:"completed"},...overrides};}

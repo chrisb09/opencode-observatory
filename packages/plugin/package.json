@@ -1,0 +1,10 @@
+{
+  "name":"opencode-observatory-plugin","version":"0.1.0","description":"Durable metadata-only OpenCode usage telemetry and history import","type":"module",
+  "main":"./dist/index.js",
+  "types":"./dist/index.d.ts",
+  "exports":{".":{"types":"./dist/index.d.ts","default":"./dist/index.js"}},
+  "bin":{"opencode-observatory":"./dist/cli.js"},"files":["dist"],
+  "scripts":{"build":"tsc -p tsconfig.json && esbuild src/index.ts src/cli.ts --outdir=dist --bundle --platform=node --format=esm --external:@opencode-ai/plugin --external:bun:sqlite","typecheck":"tsc -p tsconfig.json --noEmit"},
+  "dependencies":{"@opencode-ai/plugin":"1.18.34"},
+  "devDependencies":{"@observatory/contracts":"0.1.0","esbuild":"^0.25.0"}
+}
