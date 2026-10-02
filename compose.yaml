@@ -7,8 +7,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run npm run setup:env}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Run npm run setup:env}
     volumes:
-      # Persistent PostgreSQL storage volume: preserves all telemetry, accounts, credentials, and settings.
-      - pgdata:/var/lib/postgresql/data
+      # Persistent PostgreSQL storage volume:
+      # Defaults to the named Docker volume "pgdata". Set PGDATA_SOURCE in .env (e.g. ./data/postgres or /var/data/observatory)
+      # if you want to mount a specific host directory instead.
+      - ${PGDATA_SOURCE:-pgdata}:/var/lib/postgresql/data
       - ./deploy/init-db.sh:/docker-entrypoint-initdb.d/10-app.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U observatory_bootstrap -d observatory"]

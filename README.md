@@ -61,7 +61,7 @@ Start the PostgreSQL database and application:
 docker compose up -d --build
 ```
 
-- **Persistent Storage:** The PostgreSQL database is backed by the named Docker volume `pgdata`, preserving all telemetry, users, API keys, pricing overrides, and account assignments across restarts and updates.
+- **Persistent Storage:** The PostgreSQL database is backed by the named Docker volume `pgdata` by default, preserving all telemetry, users, API keys, pricing overrides, and account assignments across restarts and updates. To use a custom host directory instead, set `PGDATA_SOURCE` in `.env` (e.g. `PGDATA_SOURCE=./data/postgres` or `PGDATA_SOURCE=/var/data/observatory`).
 - **Port Bindings:**
   - **7692:** Web Dashboard & API (accessible on `http://localhost:7692` or your local network IP).
   - **7693:** PostgreSQL (bound strictly to `127.0.0.1` for local inspection or backups).
