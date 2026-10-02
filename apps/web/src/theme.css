@@ -58,6 +58,25 @@ input[type="checkbox"] { accent-color: var(--purple); }
 .coverage-note { margin-bottom: 20px; padding: 14px 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .coverage-note p { margin: 0; font-size: 11px; }
 
+/* Brand icon with custom logo */
+.brand-icon {
+  background: transparent !important;
+  box-shadow: none !important;
+  overflow: hidden;
+  border-radius: 9px;
+  width: 36px;
+  height: 36px;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+}
+.brand-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
 /* Compact sleek header */
 header {
   height: auto !important;

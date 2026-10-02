@@ -1,8 +1,16 @@
+<p align="center">
+  <img src="logo.png" width="128" height="128" alt="OpenCode Observatory Logo" />
+</p>
+
 # OpenCode Observatory
 
 A private, self-hosted, metadata-only usage dashboard, telemetry collector, durable historical importer, and read-only Model Context Protocol (MCP) server for [OpenCode](https://opencode.ai).
 
 Multiple machines and developers can share one private Observatory instance while retaining isolated, tenant-partitioned usage and credentials.
+
+<p align="center">
+  <img src="screenshots/example_light_mode.png" alt="OpenCode Observatory Dashboard" width="100%" />
+</p>
 
 ---
 

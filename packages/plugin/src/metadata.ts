@@ -47,7 +47,13 @@ export class Collector{
     const provider = typeof modelObj === "object" && modelObj ? modelObj.providerID : (typeof model === "string" ? model.split("/")[0] : null);
     const cost = typeof info.cost === "number" ? info.cost : null;
     const durationMs = (updated && created && updated >= created) ? Math.max(0, updated - created) : null;
+    const title = (typeof info.title === "string" && info.title.trim())
+      ? info.title.trim().slice(0, 512)
+      : (typeof info.slug === "string" && info.slug.trim())
+      ? info.slug.trim().slice(0, 512)
+      : null;
     this.record("session",info.id,{
+      title,
       parentSessionId: info.parentID ?? info.parent_id ?? null,
       sessionVersion: info.version ?? null,
       startedAt: created,

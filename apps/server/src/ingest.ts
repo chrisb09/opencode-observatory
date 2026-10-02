@@ -18,7 +18,7 @@ export async function ingest(userId: string, payload: unknown) {
           historical=entities.historical AND EXCLUDED.historical,
           runtime=CASE WHEN EXCLUDED.historical AND NOT entities.historical THEN entities.runtime ELSE EXCLUDED.runtime END,
           data=CASE WHEN EXCLUDED.historical AND NOT entities.historical THEN entities.data ELSE entities.data || EXCLUDED.data END
-        WHERE (EXCLUDED.revision > entities.revision OR (EXCLUDED.revision = entities.revision AND NOT EXCLUDED.historical))
+        WHERE (EXCLUDED.revision > entities.revision OR (EXCLUDED.revision = entities.revision AND (NOT EXCLUDED.historical OR entities.historical)))
           AND NOT (entities.data->>'status' IN ('completed','failed','cancelled') AND EXCLUDED.data->>'status'='running')
       `, values(userId, event));
       acknowledged.push(event.eventId);

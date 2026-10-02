@@ -8,7 +8,7 @@ export async function importHistory(collector:Collector,outbox:Outbox,path=colle
   const source=resolve(path);let cursor=options.all?null:outbox.cursor(source);
   const cols=new Set((db.query("PRAGMA table_info(session)").all() as any[]).map(c=>c.name));
   const has=(c:string)=>cols.has(c)?c:`NULL AS ${c}`;
-  const selectQuery=`SELECT id,project_id,parent_id,version,time_created,time_updated,${has("agent")},${has("model")},${has("cost")},${has("tokens_input")},${has("tokens_output")},${has("tokens_reasoning")},${has("tokens_cache_read")},${has("tokens_cache_write")} FROM session WHERE (time_updated>? OR (time_updated=? AND id>?)) ORDER BY time_updated,id LIMIT 25`;
+  const selectQuery=`SELECT id,project_id,parent_id,version,time_created,time_updated,${has("title")},${has("slug")},${has("agent")},${has("model")},${has("cost")},${has("tokens_input")},${has("tokens_output")},${has("tokens_reasoning")},${has("tokens_cache_read")},${has("tokens_cache_write")} FROM session WHERE (time_updated>? OR (time_updated=? AND id>?)) ORDER BY time_updated,id LIMIT 25`;
   try{
     for(;;){
       const rows=db.query(selectQuery).all(cursor?.updated_at??0,cursor?.updated_at??0,cursor?.session_id??"") as any[];

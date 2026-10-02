@@ -35,7 +35,7 @@ describe("durable delivery",()=>{
 });
 test("collector excludes content and credentials while retaining meaningful metadata",()=>{
   const records:any[]=[];const collector=new Collector(config,runtime,e=>records.push(e));
-  collector.session({id:"ses_privacy",projectID:"prj_secret",title:"PROMPT_SECRET",directory:"/PRIVATE_PATH",version:"1.17.0",time:{created:1,updated:2}});
+  collector.session({id:"ses_privacy",projectID:"prj_secret",title:"My Session Title",directory:"/PRIVATE_PATH",version:"1.17.0",time:{created:1,updated:2}});
   collector.message({id:"msg_privacy",sessionID:"ses_privacy",role:"assistant",providerID:"openai",modelID:"test-model",time:{created:1,completed:10},tokens:{input:5,output:4,reasoning:1,cache:{read:2,write:0}},cost:0.1,error:{name:"APIError",data:{message:"PROMPT_SECRET sk-key-secret",responseBody:"PROMPT_SECRET",statusCode:429}}});
   collector.part({type:"tool",id:"part_privacy",sessionID:"ses_privacy",messageID:"msg_privacy",tool:"bash",callID:"call_test",state:{status:"completed",input:{command:"COMMAND_SECRET"},output:"TOOL_SECRET",title:"TITLE_SECRET",time:{start:2,end:7},metadata:{apiKey:"KEY_SECRET"}}});
   collector.part({type:"text",id:"text_privacy",sessionID:"ses_privacy",messageID:"msg_privacy",text:"OUTPUT_SECRET"});
