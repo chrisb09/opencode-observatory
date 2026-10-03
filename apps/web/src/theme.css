@@ -141,3 +141,29 @@ header {
 }
 
 @media(max-width:760px) { .breadcrumb { max-width: 130px; } .breadcrumb span { margin: 0 4px; } .header-controls { gap: 4px; } .health-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .theme-control select { max-width: 90px; } }
+
+/* Shared chart controls and dense machine inventory. */
+.analytics-controls { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
+.control-group { display: flex; align-items: center; gap: 10px; }
+.control-group > span { font-size: 11px; color: var(--muted); }
+.analytics-controls .segmented { display: flex; flex-wrap: wrap; }
+.charts-grid > .panel { min-width: 0; }
+.usage-panel .panel-title, .activity-panel .panel-title { padding-bottom: 12px; }
+.model-legend button { max-width: 100%; overflow-wrap: anywhere; text-align: left; }
+.chart-tooltip span { overflow-wrap: anywhere; }
+.chart-tooltip b, .numeric { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.numeric { text-align: right; }
+.machine-table { margin-bottom: 20px; }
+.machine-table td { padding-top: 12px; padding-bottom: 12px; vertical-align: top; }
+.machine-details { min-width: 120px; font-size: 11px; }
+.machine-details summary { cursor: pointer; color: var(--purple); white-space: nowrap; }
+.machine-installation { min-width: 240px; max-width: 340px; padding: 12px 0; }
+.machine-installation + .machine-installation { border-top: 1px solid var(--border); }
+.machine-installation p { font-size: 10px; margin-bottom: 8px; overflow-wrap: anywhere; }
+.machine-installation .versions > div { padding: 5px 0; }
+@media(max-width:760px) {
+  .analytics-controls { align-items: flex-start; }
+  .control-group { flex-wrap: wrap; gap: 6px; max-width: 100%; }
+  .analytics-controls .segmented button { padding: 6px 8px; }
+  .model-legend { gap: 5px; }
+}

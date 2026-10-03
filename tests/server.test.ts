@@ -116,6 +116,37 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     const assignedDrill=(await app.inject({url:`/api/entities/step?sessionId=ses_assign&account=${encodeURIComponent(after.groups[0].id)}`,headers:bearer(keyA)})).json();expect(assignedDrill.total).toBe(1);
     expect((await app.inject({url:"/api/analytics?sessionId=ses_assign&groupBy=account",headers:bearer(keyB)})).json().summary.calls).toBe(0);
   });
+  test("grouped timelines reconcile calls, tokens and costs; Antigravity is separate from Google",async()=>{
+    const session="ses_grouped_charts",from=Date.UTC(2026,9,1),to=from+86400000;
+    const definitions=[
+      ["google","antigravity-gemini-3.8-flash","a","desk"],
+      ["google","antigravity-claude-sonnet-4-6","b","laptop"],
+      ["google","gemini-3.8-flash","a","desk"],
+      ["openai","gpt-5.5","a","laptop"]
+    ];
+    const events=definitions.map(([provider,model,account,machine],i)=>event({sessionId:session,machine,entityId:`grouped_${i}`,messageId:`grouped_message_${i}`,observedAt:from+i*3600000,data:{...event().data,provider,model,account:`hmac:${account}`,credential:`hmac:key_${account}`,accountSource:"observed",cost:i===3?null:.1*(i+1)}}));
+    await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events}});
+    const query=`/api/analytics?sessionId=${session}&from=${from}&to=${to}`;
+    for(const grouping of ["model","provider","account","credential","machine"]){
+      const r=(await app.inject({url:`${query}&groupBy=${grouping}`,headers:bearer(keyA)})).json();
+      expect(r.groupBy).toBe(grouping);expect(r.summary.calls).toBe(4);
+      for(const metric of ["calls","total_tokens","cost","unknown_cost_calls"]){
+        const sum=r.groupSeries.reduce((n:number,g:any)=>n+g.series.reduce((total:number,p:any)=>total+(p[metric]??0),0),0);
+        expect(sum).toBeCloseTo(r.summary[metric]);
+      }
+      for(const g of r.groupSeries){expect(g.series).toHaveLength(24);expect(g.series[10].calls).toBe(0);expect(g.series[10].cost).toBe(0);}
+    }
+    const providers=(await app.inject({url:`${query}&groupBy=provider`,headers:bearer(keyA)})).json();
+    expect(providers.groups).toHaveLength(3);expect(providers.groups.find((g:any)=>g.id==="antigravity").calls).toBe(2);
+    for(const [provider,count] of [["antigravity",2],["google",1]]){
+      const r=(await app.inject({url:`${query}&provider=${provider}&groupBy=provider`,headers:bearer(keyA)})).json();
+      expect(r.summary.calls).toBe(count);expect(r.groups).toHaveLength(1);expect(r.groups[0].id).toBe(provider);
+    }
+    const account=(await app.inject({url:`${query}&account=google%2Fhmac%3Ab&groupBy=account`,headers:bearer(keyA)})).json();
+    expect(account.groups).toHaveLength(1);expect(account.groupSeries).toHaveLength(1);expect(account.summary.calls).toBe(1);
+    const machine=(await app.inject({url:`${query}&machine=desk&groupBy=machine`,headers:bearer(keyA)})).json();
+    expect(machine.groups).toHaveLength(1);expect(machine.groupSeries[0].id).toBe("desk");expect(machine.summary.calls).toBe(2);
+  });
   test("numeric sorting applies before pagination and sessions sum mixed-model canonical usage",async()=>{
     const session="ses_sort",rows=[1,20,3].map(n=>event({sessionId:session,kind:"tool",entityId:`sort_${n}`,messageId:null,data:{tool:"bash",durationMs:n,status:"completed"}}));
     await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:rows}});

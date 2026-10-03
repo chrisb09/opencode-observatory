@@ -1,10 +1,14 @@
 import React,{useState,useEffect,useCallback,useMemo} from "react";
 import {createRoot} from "react-dom/client";
-import {XAxis,YAxis,CartesianGrid,Tooltip,ResponsiveContainer,BarChart,Bar,Cell} from "recharts";
+import {XAxis,YAxis,CartesianGrid,Tooltip,ResponsiveContainer,BarChart,Bar} from "recharts";
 import {Activity,ArrowUpRight,Boxes,ChartNoAxesCombined,Check,ChevronLeft,ChevronRight,Coins,Copy,Download,Filter,KeyRound,Layers,LogOut,Monitor,RefreshCw,Settings,ShieldCheck,Terminal,Users,X,Zap,Paperclip,DollarSign} from "lucide-react";
 import "./style.css";
 import "./theme.css";
-import { UsageChart, modelColor } from "./UsageChart";
+import { UsageChart } from "./UsageChart";
+import { ActivityChart } from "./ActivityChart";
+import { groupColors } from "./colors";
+import { usageMetrics, type UsageMetric } from "./chartMetrics";
+import { providerGroup } from "@observatory/contracts";
 import { AccountAssignments } from "./AccountAssignments";
 import { money, chartTooltipStyle } from "./format";
 import { ThemeControl } from "./Theme";
@@ -90,6 +94,9 @@ function App(){
   const[user,setUser]=useState<User|null>(null),[checking,setChecking]=useState(true),[view,setView]=useState("overview"),[error,setError]=useState(""),[busy,setBusy]=useState(false);
   const[range,setRange]=useState("7"),[provider,setProvider]=useState(""),[model,setModel]=useState(""),[account,setAccount]=useState(""),[credential,setCredential]=useState(""),[machine,setMachine]=useState(""),[status,setStatus]=useState(""),[customFrom,setCustomFrom]=useState(""),[customTo,setCustomTo]=useState("");
   const[accountGrouping,setAccountGrouping]=useState<"provider"|"account"|"credential">("account");
+  const[modelGrouping,setModelGrouping]=useState<"model"|"provider">("model"),[metric,setMetric]=useState<UsageMetric>("total_tokens");
+  const[machineInventory,setMachineInventory]=useState<any[]>([]);
+  const grouping=view==="accounts"?accountGrouping:view==="machines"?"machine":view==="models"?modelGrouping:"model";
   const[serverSort,setServerSort]=useState({key:"observed_at",dir:"desc" as "asc"|"desc"});
   const[dimensions,setDimensions]=useState<any[]>([]),[stats,setStats]=useState<any>(null),[rows,setRows]=useState<Entity[]>([]),[total,setTotal]=useState(0),[page,setPage]=useState(0),[tick,setTick]=useState(0),[selected,setSelected]=useState<Entity|null>(null),[session,setSession]=useState<Entity|null>(null);
   const[loadedAt,setLoadedAt]=useState<number|null>(null),[listingStats,setListingStats]=useState<any>(null);
@@ -99,19 +106,19 @@ function App(){
 
   const timeframe=useMemo(()=>{const to=Date.now();return range==="custom"?{from:customFrom?new Date(customFrom).getTime():undefined,to:customTo?new Date(customTo).getTime():to}:range==="all"?{from:undefined,to}:{from:to-Number(range)*86400000,to};},[range,customFrom,customTo,tick]);
   const query=useCallback((listing=true)=>{
-    const q=new URLSearchParams({groupBy:"model"});
+    const q=new URLSearchParams({groupBy:grouping});
     if(listing){q.set("limit","50");q.set("offset",String(page*50));q.set("sortBy",serverSort.key);q.set("sortDir",serverSort.dir);}
     if(timeframe.from!==undefined)q.set("from",String(timeframe.from));q.set("to",String(timeframe.to));
     for(const[k,v]of Object.entries({provider,model,account,credential,machine,status}))if(v)q.set(k,v);
     if(session){q.set("sessionId",session.entity_id);q.set("installationId",session.installation_id);}
     return q;
-  },[timeframe,provider,model,account,credential,machine,status,page,session,serverSort]);
+  },[timeframe,provider,model,account,credential,machine,status,page,session,serverSort,grouping]);
 
   useEffect(()=>{
     if(!user||view==="settings")return;const abort=new AbortController();setBusy(true);setError("");
-    const q=query(!["overview","models","accounts"].includes(view));let work:Promise<any>;
+    const q=query(!["overview","models","accounts","machines"].includes(view));let work:Promise<any>;
     if(["overview","models","accounts"].includes(view))work=request(`/api/analytics?${q}`,undefined,undefined,abort.signal).then(setStats);
-    else if(view==="machines")work=request("/api/machines",undefined,undefined,abort.signal).then(value=>{setRows(value);setTotal(value.length);});
+    else if(view==="machines")work=Promise.all([request(`/api/analytics?${q}`,undefined,undefined,abort.signal),request("/api/machines",undefined,undefined,abort.signal)]).then(([analytics,inventory])=>{setStats(analytics);setMachineInventory(inventory);});
     else if(view==="errors")work=request(`/api/errors?${q}`,undefined,undefined,abort.signal).then(value=>{setRows(value.items);setTotal(value.total);setListingStats(value.summary);});
     else {const kind=session?"step":({sessions:"session",requests:"attempt",tools:"tool",attachments:"attachment"} as any)[view];work=request(`/api/entities/${kind}?${q}`,undefined,undefined,abort.signal).then(value=>{setRows(value.items);setTotal(value.total);setListingStats(value.summary??null);});}
     work.then(()=>setLoadedAt(Date.now())).catch(e=>{if(e.name!=="AbortError"){setError(e.message);if(e.status===401)setUser(null);}}).finally(()=>{if(!abort.signal.aborted)setBusy(false);});
@@ -121,19 +128,30 @@ function App(){
   const navigate=(id:string)=>{setView(id);setPage(0);setSession(null);setSelected(null);setListingStats(null);setStatus("");setError("");setServerSort({key:id==="errors"?"occurrences":"observed_at",dir:"desc"});window.scrollTo({top:0});};
   const reset=()=>{setProvider("");setModel("");setAccount("");setCredential("");setMachine("");setStatus("");setPage(0);};
   const refresh=()=>{clearClientCache();setTick(x=>x+1);};
-  const logout=async()=>{await request("/api/auth/logout",{});clearClientCache();setUser(null);setStats(null);setRows([]);setSelected(null);setDimensions([]);};
+  const logout=async()=>{await request("/api/auth/logout",{});clearClientCache();setUser(null);setStats(null);setRows([]);setSelected(null);setDimensions([]);setMachineInventory([]);};
 
-  const groups=stats?(view==="accounts"?{provider:stats.providerGroups,account:stats.accountGroups,credential:stats.credentialGroups}[accountGrouping]:stats.modelGroups)??[]:[];
+  const groups=stats?({model:stats.modelGroups,provider:stats.providerGroups,account:stats.accountGroups,credential:stats.credentialGroups,machine:stats.machineGroups} as any)[grouping]??[]:[];
+  const modelUniverse=useMemo(()=>dimensions.map(d=>({id:`${d.provider}/${d.model}`,label:d.model,provider:providerGroup(d.provider,d.model??"")})),[dimensions]);
+  const colors=useMemo(()=>groupColors(groups,grouping,["model","provider"].includes(grouping)?[...modelUniverse,...groups]:groups),[groups,grouping,modelUniverse]);
+  const machineData=useMemo(()=>{
+    const names=new Set<string>(groups.map((g:any)=>g.id));
+    if(!(provider||model||account||credential))for(const item of machineInventory)if(!machine||item.machine===machine)names.add(item.machine);
+    return [...names].map(name=>{
+      const inventories=machineInventory.filter(i=>i.machine===name);
+      return {id:name,label:name,calls:0,total_tokens:0,cost:0,market_cost:0,...groups.find((g:any)=>g.id===name),inventories,last_seen:inventories.length?Math.max(...inventories.map(i=>Number(i.last_seen))):null};
+    });
+  },[groups,machineInventory,provider,model,account,credential,machine]);
+  const machinesSort=useSortable(machineData,"calls","desc");
   const groupsSort=useSortable(groups,"calls","desc");
   const rowsSort={sorted:rows,key:serverSort.key,dir:serverSort.dir,onSort:(key:string)=>{setServerSort(old=>({key,dir:old.key===key&&old.dir==="desc"?"asc":"desc"}));setPage(0);}};
 
   if(checking)return <div className="auth"><div className="brand"><Activity/> Observatory</div><p>Connecting to your observatory…</p></div>;
   if(!user)return <Login onLogin={setUser}/>;
   const current=views.find(v=>v.id===view)!;
-  const options=(field:string)=>[...new Set(dimensions.map(x=>x[field]).filter(Boolean))].sort() as string[];
+  const options=(field:string)=>[...new Set(dimensions.map(x=>field==="provider"?providerGroup(x.provider,x.model??""):x[field]).filter(Boolean))].sort() as string[];
   const select=(label:string,value:string,set:(v:string)=>void,values:string[])=> <label className="filter"><span>{label}</span><select value={value} onChange={e=>{set(e.target.value);setPage(0);}}><option value="">All {label.toLowerCase()}</option>{values.map(v=><option key={v} value={v}>{label==="Accounts"?short(v):v}</option>)}</select></label>;
   const identitySelect=(field:"account"|"credential")=>{
-    const entries=new Map<string,string>();for(const d of dimensions){if(!d.provider||(provider&&d.provider!==provider))continue;const id=`${d.provider}/${d[field]??(field==="credential"&&d.authType==="oauth"?"oauth":"unassigned")}`;entries.set(id,`${d.provider} · ${d[`${field}_label`]??"Unavailable"}`);}
+    const entries=new Map<string,string>();for(const d of dimensions){if(!d.provider||(provider&&providerGroup(d.provider,d.model??"")!==provider))continue;const id=`${d.provider}/${d[field]??(field==="credential"&&d.authType==="oauth"?"oauth":"unassigned")}`;entries.set(id,`${d.provider} · ${d[`${field}_label`]??"Unavailable"}`);}
     return <label className="filter"><span>{field==="account"?"Accounts":"Provider keys"}</span><select value={field==="account"?account:credential} onChange={e=>{(field==="account"?setAccount:setCredential)(e.target.value);setPage(0);}}><option value="">All {field==="account"?"accounts":"provider keys"}</option>{[...entries].sort((a,b)=>a[1].localeCompare(b[1])).map(([id,label])=><option key={id} value={id}>{label}</option>)}</select></label>;
   };
 
@@ -155,7 +173,7 @@ function App(){
           <ThemeControl/>
         </div>
       </header>
-      {view!=="settings"&&view!=="machines"&&<section className="filters"><Filter size={16}/><label className="filter"><span>Timeframe</span><select value={range} onChange={e=>{setRange(e.target.value);setPage(0);}}><option value="1">Last 24 hours</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="all">All time</option><option value="custom">Custom range</option></select></label>
+      {view!=="settings"&&<section className="filters"><Filter size={16}/><label className="filter"><span>Timeframe</span><select value={range} onChange={e=>{setRange(e.target.value);setPage(0);}}><option value="1">Last 24 hours</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="all">All time</option><option value="custom">Custom range</option></select></label>
         {range==="custom"&&<><label className="filter"><span>From (local)</span><input type="datetime-local" value={customFrom} onChange={e=>setCustomFrom(e.target.value)}/></label><label className="filter"><span>To (exclusive)</span><input type="datetime-local" value={customTo} onChange={e=>setCustomTo(e.target.value)}/></label></>}
         {select("Providers",provider,setProvider,options("provider"))}{select("Models",model,setModel,options("model"))}{select("Machines",machine,setMachine,options("machine"))}
         {identitySelect("account")}{identitySelect("credential")}
@@ -163,6 +181,12 @@ function App(){
         {view==="requests"&&select("Status",status,setStatus,["running","completed","failed","cancelled"])}<button className="text-button" onClick={reset}>Reset</button></section>}
       {error&&<div className="error" role="alert">{error}<button className="text-button" onClick={refresh}>Retry</button></div>}
       {busy&&<div className="loading-line"/>}
+
+      {["overview","models","accounts","machines"].includes(view)&&<div className="analytics-controls">
+        {view==="models"&&<div className="control-group"><span>Group by</span><div className="segmented">{(["model","provider"] as const).map(g=><button key={g} aria-pressed={modelGrouping===g} className={modelGrouping===g?"chosen":""} onClick={()=>setModelGrouping(g)}>{g==="model"?"Models":"Providers"}</button>)}</div></div>}
+        {view==="accounts"&&<div className="control-group"><span>Group by</span><div className="segmented">{(["account","credential","provider"] as const).map(g=><button key={g} aria-pressed={accountGrouping===g} className={accountGrouping===g?"chosen":""} onClick={()=>setAccountGrouping(g)}>{g==="credential"?"Provider keys":g==="provider"?"Providers":"Accounts"}</button>)}</div></div>}
+        <div className="control-group"><span>Measure</span><div className="segmented">{usageMetrics.map(([key,label])=><button key={key} aria-pressed={metric===key} className={metric===key?"chosen":""} onClick={()=>setMetric(key)}>{label}</button>)}</div></div>
+      </div>}
 
       {["overview","models","accounts"].includes(view)&&stats&&<>
         <div className="stats-grid">
@@ -174,7 +198,7 @@ function App(){
           <Stat label="Market value (pseudo-cost)" value={money(stats.summary.market_cost)} hint={`${n(stats.summary.unknown_market_calls)} unpriced calls · subscription fees excluded`} icon={DollarSign}/>
         </div>
         {view==="accounts"&&<div className="coverage-note"><p><strong>{n(stats.summary.account_count)} known accounts · {n(stats.summary.credential_count)} provider API keys.</strong> Imported history did not record its original identities. OAuth accounts have no provider API key. Unknown history is kept separate; use aliases and explicit assignments below.</p></div>}
-        <div className="charts-grid"><UsageChart stats={stats} perModel={view==="models"}/><section className="panel"><div className="panel-title"><div><h2>{view==="accounts"?"Account activity":"Model activity"}</h2><p>Top 6 by model calls</p></div><Boxes size={18}/></div>{groups.length?<div className="chart"><ResponsiveContainer width="100%" height={300}><BarChart layout="vertical" data={groups.slice(0,6).map((x:any)=>({...x,label:x.label.length>24?x.label.slice(0,24)+"…":x.label}))}><CartesianGrid horizontal={false} stroke="var(--chart-grid)" strokeDasharray="3 4"/><XAxis type="number" hide/><YAxis type="category" dataKey="label" width={155} tick={{fill:"var(--muted)",fontSize:11}} axisLine={false} tickLine={false}/><Tooltip cursor={false} contentStyle={chartTooltipStyle} labelStyle={{color:"var(--text)"}}/><Bar dataKey="calls" name="Model calls" radius={[0,4,4,0]} barSize={18} isAnimationActive={false}>{groups.slice(0,6).map((x:any)=><Cell key={x.id} fill={modelColor(x.id)}/>)}</Bar></BarChart></ResponsiveContainer></div>:<Empty/>}</section></div>
+        {stats.groupBy===grouping&&<div className="charts-grid"><UsageChart key={`${view}/${grouping}`} stats={stats} metric={metric} groups={groups} colors={colors} grouped={view!=="overview"} groupLabel={grouping==="credential"?"provider keys":`${grouping}s`}/><ActivityChart groups={groups} metric={metric} colors={colors} title={grouping==="provider"?"Provider activity":grouping==="account"?"Account activity":grouping==="credential"?"Provider key activity":"Model activity"}/></div>}
         <section className="panel reuse-panel"><div className="panel-title"><div><h2>Context reuse</h2><p>Provider-reported prompt caching · token-weighted, separate from context-window utilization</p></div><RefreshCw size={18}/></div><div className="reuse-metrics"><Mini label="Cached share of measured prompt tokens" value={percent(stats.summary.cache_reuse_ratio)}/><Mini label="Measured calls with cache hits" value={percent(stats.summary.cache_hit_ratio)}/><Mini label="Cache read / write tokens" value={`${n(stats.summary.cache_read_tokens)} / ${n(stats.summary.cache_write_tokens)}`}/><Mini label="Estimated cache-read API reduction" value={money(stats.summary.cache_savings)}/></div><div className="chart"><ResponsiveContainer width="100%" height={150}><BarChart data={stats.series}><XAxis dataKey="time" hide/><YAxis tickFormatter={n} width={60} tick={{fill:"var(--muted)",fontSize:10}}/><Tooltip cursor={false} contentStyle={chartTooltipStyle} labelStyle={{color:"var(--text)"}} labelFormatter={v=>new Date(Number(v)).toLocaleString()} formatter={n}/><Bar dataKey="input_tokens" name="Uncached input" stackId="prompt" fill="var(--purple)" isAnimationActive={false}/><Bar dataKey="cache_read_tokens" name="Cache reads" stackId="prompt" fill="var(--cache-read)" isAnimationActive={false}/><Bar dataKey="cache_write_tokens" name="Cache writes" stackId="prompt" fill="var(--cache-write)" isAnimationActive={false}/></BarChart></ResponsiveContainer></div><p className="chart-caption">Cache information available for {n(stats.summary.known_cache_calls)} of {n(stats.summary.calls)} calls. Estimated reductions use matching API rates, not subscription invoices.</p></section>
         <div className="charts-grid distribution-grid"><section className="panel"><div className="panel-title"><div><h2>Generated output lengths</h2><p>Adaptive token ranges · explicit outlier tail when needed</p></div><Layers size={18}/></div>{stats.outputDistribution?.length?<div className="chart"><DistributionChart data={stats.outputDistribution}/></div>:<Empty/>}</section>
           <section className="panel"><div className="panel-title"><div><h2>Context utilization</h2><p>Observed provider attempts · cached tokens included where measurable</p></div><Activity size={18}/></div>{stats.contextDistribution?.length?<div className="chart"><DistributionChart data={stats.contextDistribution} valueKey="attempts" name="HTTP attempts" color="var(--purple)"/><p className="chart-caption">Median utilization {percent(stats.contextPercentiles?.p50_ratio)} · p95 {percent(stats.contextPercentiles?.p95_ratio)}. Values use the request model's configured context limit.</p></div>:<div className="empty compact"><Activity size={25}/><p>No context limits and usage captured yet.<br/>Connect an instance with request transport coverage.</p></div>}</section></div>
@@ -186,9 +210,9 @@ function App(){
           <Mini label="Failed HTTP attempts" value={`${n(stats.transport.failed)} / ${n(stats.transport.attempts)}`}/>
           <Mini label="Imported model calls" value={n(stats.summary.imported_calls)}/>
         </div>
-        <section className="panel"><div className="panel-title"><div><h2>{view==="accounts"?"Account breakdown":"Model breakdown"}</h2><p>{view==="accounts"?"Provider totals → accounts → provider credentials · identities are distinct from upload keys":"Click headers to sort · recorded cost vs API-rate equivalent"}</p></div>{view==="accounts"?<div className="segmented">{(["provider","account","credential"] as const).map(g=><button key={g} className={accountGrouping===g?"chosen":""} onClick={()=>setAccountGrouping(g)}>{g==="credential"?"Provider keys":g==="provider"?"Providers":"Accounts"}</button>)}</div>:<span className="badge neutral">{groups.length} groups</span>}</div>
+        <section className="panel"><div className="panel-title"><div><h2>{grouping==="provider"?"Provider breakdown":view==="accounts"?"Account breakdown":"Model breakdown"}</h2><p>{view==="accounts"?"Provider totals → accounts → provider credentials · identities are distinct from upload keys":"Click headers to sort · recorded cost vs API-rate equivalent"}</p></div><span className="badge neutral">{groups.length} groups</span></div>
           <div className="table-wrap"><table><thead><tr>
-            <Th label={view==="accounts"?accountGrouping==="provider"?"Provider":accountGrouping==="credential"?"Provider key":"Account":"Provider / model"} sortKey="label" currentKey={groupsSort.key} dir={groupsSort.dir} onSort={groupsSort.onSort}/>
+            <Th label={grouping==="provider"?"Provider":view==="accounts"?accountGrouping==="credential"?"Provider key":"Account":"Provider / model"} sortKey="label" currentKey={groupsSort.key} dir={groupsSort.dir} onSort={groupsSort.onSort}/>
             <Th label="Calls" sortKey="calls" currentKey={groupsSort.key} dir={groupsSort.dir} onSort={groupsSort.onSort} align="right"/>
             <Th label="Input" sortKey="input_tokens" currentKey={groupsSort.key} dir={groupsSort.dir} onSort={groupsSort.onSort} align="right"/>
             <Th label="Output" sortKey="output_tokens" currentKey={groupsSort.key} dir={groupsSort.dir} onSort={groupsSort.onSort} align="right"/>
@@ -200,7 +224,7 @@ function App(){
             <Th label="Cost" sortKey="cost" currentKey={groupsSort.key} dir={groupsSort.dir} onSort={groupsSort.onSort} align="right"/>
             <Th label="Market rate" sortKey="market_cost" currentKey={groupsSort.key} dir={groupsSort.dir} onSort={groupsSort.onSort} align="right"/>
           </tr></thead><tbody>{groupsSort.sorted.map((x:any)=><tr key={x.id}>
-            <td><span className="model-dot" style={{background:modelColor(x.id)}}/>{view==="accounts"?<button className="table-link" onClick={()=>{if(accountGrouping==="provider"){setProvider(x.id);setAccount("");setCredential("");setAccountGrouping("account");}else if(accountGrouping==="account"){setAccount(x.id);setAccountGrouping("credential");}else{setCredential(x.id);navigate("requests");}}}>{x.label}</button>:x.label}{view==="accounts"&&x.attribution&&<small>{x.attribution==="unassigned"?"Identity unavailable":`${x.attribution} identity`}</small>}{view==="accounts"&&x.credential_kind&&<small>{x.credential_kind==="oauth"?"OAuth · no API key":x.credential_kind==="unavailable"?"Original key not recorded":"Observed API-key fingerprint"}</small>}</td>
+            <td><span className="model-dot" style={{background:colors[x.id]}}/>{view==="accounts"?<button className="table-link" onClick={()=>{if(accountGrouping==="provider"){setProvider(x.id);setAccount("");setCredential("");setAccountGrouping("account");}else if(accountGrouping==="account"){setAccount(x.id);setAccountGrouping("credential");}else{setCredential(x.id);navigate("requests");}}}>{x.label}</button>:x.label}{view==="accounts"&&x.attribution&&<small>{x.attribution==="unassigned"?"Identity unavailable":`${x.attribution} identity`}</small>}{view==="accounts"&&x.credential_kind&&<small>{x.credential_kind==="oauth"?"OAuth · no API key":x.credential_kind==="unavailable"?"Original key not recorded":"Observed API-key fingerprint"}</small>}</td>
             <td style={{textAlign:"right"}}>{n(x.calls)}</td>
             <td style={{textAlign:"right"}}>{n(x.input_tokens)}</td>
             <td style={{textAlign:"right"}}>{n(x.output_tokens)}</td>
@@ -303,7 +327,15 @@ function App(){
         <div className="pagination"><span>{total?Math.min(page*50+1,total):0}–{Math.min((page+1)*50,total)} of {total} groups</span><div><button className="icon" aria-label="Previous page" disabled={page===0} onClick={()=>setPage(page-1)}><ChevronLeft size={18}/></button><button className="icon" aria-label="Next page" disabled={(page+1)*50>=total} onClick={()=>setPage(page+1)}><ChevronRight size={18}/></button></div></div>
       </section>}
 
-      {view==="machines"&&<div className="machine-grid">{rows.map((row:any)=><section className="panel machine" key={row.installation_id}><div className="machine-icon"><Monitor/></div><h2>{row.machine}</h2><p className="mono">{short(row.installation_id)}</p><div className="machine-metrics"><Mini label="Instances" value={n(row.instances)}/><Mini label="Sessions" value={n(row.sessions)}/><Mini label="HTTP attempts" value={n(row.attempts)}/></div><div className="divider"/><p>Last captured {date(row.last_seen)}</p><VersionInventory runtime={row.runtime}/></section>)}{!rows.length&&!busy&&<Empty/>}</div>}
+      {view==="machines"&&stats?.groupBy==="machine"&&<>
+        <div className="charts-grid"><UsageChart key="machines" stats={stats} metric={metric} groups={groups} colors={colors} groupLabel="machines"/><ActivityChart groups={groups} metric={metric} colors={colors} title="Machine activity"/></div>
+        <section className="panel machine-table"><div className="panel-title"><div><h2>Machine breakdown</h2><p>Usage in the selected timeframe · expand a machine for installation and runtime details</p></div><span className="badge neutral">{machineData.length} machines</span></div>
+          <div className="table-wrap"><table><thead><tr>{[["Machine","label"],["Calls","calls"],["Total tokens","total_tokens"],["Cost","cost"],["Market rate","market_cost"],["Last captured (all time)","last_seen"]].map(([label,key])=><Th key={key} label={label} sortKey={key} currentKey={machinesSort.key} dir={machinesSort.dir} onSort={machinesSort.onSort} align={key==="label"||key==="last_seen"?"left":"right"}/>)}<th>Details</th></tr></thead><tbody>{machinesSort.sorted.map(row=><tr key={row.id}>
+            <td><span className="model-dot" style={{background:colors[row.id]??"var(--muted)"}}/><strong>{row.label}</strong></td><td className="numeric">{n(row.calls)}</td><td className="numeric">{n(row.total_tokens)}</td><td className="numeric">{money(row.cost)}</td><td className="numeric">{money(row.market_cost)}</td><td>{row.last_seen?date(row.last_seen):"—"}</td>
+            <td><details className="machine-details"><summary>{row.inventories.length} installation{row.inventories.length===1?"":"s"}</summary>{row.inventories.map((item:any)=><div className="machine-installation" key={item.installation_id}><p className="mono">{item.installation_id}</p><p>All-time inventory: {n(item.instances)} instances · {n(item.sessions)} sessions · {n(item.attempts)} HTTP attempts</p><VersionInventory runtime={item.runtime}/></div>)}</details></td>
+          </tr>)}</tbody></table>{!machineData.length&&!busy&&<Empty/>}</div>
+        </section>
+      </>}
       {view==="settings"&&<SettingsPage user={user} onError={setError}/>}
       <footer>OpenCode Observatory <span>{loadedAt?`Updated ${new Date(loadedAt).toLocaleTimeString()}`:"Your private AI usage workspace"}</span></footer>
     </main>

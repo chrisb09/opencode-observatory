@@ -1,4 +1,4 @@
-import { FilterSchema, type Filters } from "@observatory/contracts";
+import { FilterSchema, providerGroup, type Filters } from "@observatory/contracts";
 import { tenant } from "./db.js";
 import { cached } from "./cache.js";
 import { Aggregate, normalizeUsage, number, tokenCost, resolveMarket, chooseBucket, bucketTime, nextBucket, percentile, outputHistogram, type UsageRecord, type Rates } from "./metrics.js";
@@ -8,7 +8,12 @@ function where(f: Filters, base = "e", start = 2, identity = true) {
   const add = (column: string, value: unknown, op = "=") => { values.push(value); conditions.push(`${column} ${op} $${start + values.length - 1}`); };
   if (f.from !== undefined) add(`${base}.observed_at`, f.from, ">=");
   if (f.to !== undefined) add(`${base}.observed_at`, f.to, "<");
-  for (const key of ["provider", "model", "status"] as const) if (f[key]) add(`${base}.data->>'${key}'`, f[key]);
+  if (f.provider === "antigravity") conditions.push(`(${base}.data->>'provider'='antigravity' OR (${base}.data->>'provider'='google' AND ${base}.data->>'model' LIKE 'antigravity-%'))`);
+  else if (f.provider) {
+    add(`${base}.data->>'provider'`, f.provider);
+    if (f.provider === "google") conditions.push(`COALESCE(${base}.data->>'model','') NOT LIKE 'antigravity-%'`);
+  }
+  for (const key of ["model", "status"] as const) if (f[key]) add(`${base}.data->>'${key}'`, f[key]);
   if (identity) for (const key of ["account", "credential"] as const) if (f[key]) add(`${base}.data->>'${key}'`, f[key]);
   if (f.machine) add(`${base}.machine`, f.machine);
   if (f.sessionId) add(`${base}.session_id`, f.sessionId);
@@ -71,29 +76,35 @@ async function facts(userId: string, f: Filters) {
     return { records: records(rows.rows, lookup).filter(r => identityMatches(r, f)), lookup };
   }));
 }
+function groupIdentity(r: UsageRecord, type: Filters["groupBy"]) {
+  const provider = providerGroup(r.provider, r.model);
+  const id = { model: r.model_id, provider, account: r.account_id, credential: r.credential_id, machine: r.machine, agent: r.agent }[type];
+  const label = type === "account" ? `${r.provider} · ${r.account_label}` : type === "credential" ? `${r.provider} · ${r.credential_label}` : type === "model" ? `${provider}/${r.model}` : id;
+  return { id, label, provider: ["model", "provider"].includes(type) ? provider : ["account", "credential"].includes(type) ? r.provider : null };
+}
 function group(records: UsageRecord[], type: Filters["groupBy"]) {
   const groups = new Map<string, { aggregate: Aggregate; label: string; provider: string | null; attribution: string | null; credential_kind?: string }>();
   for (const r of records) {
-    const id = { model: r.model_id, provider: r.provider, account: r.account_id, credential: r.credential_id, machine: r.machine, agent: r.agent }[type];
-    const label = type === "account" ? `${r.provider} · ${r.account_label}` : type === "credential" ? `${r.provider} · ${r.credential_label}` : id;
-    if (!groups.has(id)) groups.set(id, { aggregate: new Aggregate(), label, provider: ["account", "credential", "provider"].includes(type) ? r.provider : null, attribution: type === "account" ? r.attribution : null, ...(type === "credential" ? {credential_kind:r.credential_kind} : {}) });
+    const { id, label, provider } = groupIdentity(r, type);
+    if (!groups.has(id)) groups.set(id, { aggregate: new Aggregate(), label, provider, attribution: type === "account" ? r.attribution : null, ...(type === "credential" ? {credential_kind:r.credential_kind} : {}) });
     groups.get(id)!.aggregate.add(r, true);
   }
   return [...groups].map(([id, v]) => ({ id, label: v.label, provider: v.provider, attribution: v.attribution, credential_kind:v.credential_kind, ...v.aggregate.finish(true) })).sort((a, b) => b.calls - a.calls || a.id.localeCompare(b.id));
 }
-function series(records: UsageRecord[], from: number, to: number) {
+function series(records: UsageRecord[], from: number, to: number, type: Filters["groupBy"] = "model") {
   const bucket = chooseBucket(from, to);
-  const totals = new Map<number, Aggregate>(), models = new Map<string, Map<number, Aggregate>>();
+  const totals = new Map<number, Aggregate>(), models = new Map<string, Map<number, Aggregate>>(), labels = new Map<string, string>();
   for (const r of records) {
     const time = bucketTime(r.time, bucket);
     if (!totals.has(time)) totals.set(time, new Aggregate()); totals.get(time)!.add(r);
-    if (!models.has(r.model_id)) models.set(r.model_id, new Map());
-    const map = models.get(r.model_id)!; if (!map.has(time)) map.set(time, new Aggregate()); map.get(time)!.add(r);
+    const { id, label } = groupIdentity(r, type); labels.set(id, label);
+    if (!models.has(id)) models.set(id, new Map());
+    const map = models.get(id)!; if (!map.has(time)) map.set(time, new Aggregate()); map.get(time)!.add(r);
   }
   const timeline: number[] = [];
   for (let t = bucketTime(from, bucket); t < to && timeline.length < 768; t = nextBucket(t, bucket)) timeline.push(t);
-  const empty = { calls: 0, input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: 0, market_cost: 0, cache_savings: 0, cache_reuse_ratio: null, cache_hit_ratio: null, unknown_usage_calls: 0, unknown_market_calls: 0 };
-  return { bucket, series: timeline.map(time => ({ time, ...(totals.get(time)?.finish() ?? empty) })), modelSeries: [...models].sort(([a], [b]) => a.localeCompare(b)).map(([id, points]) => ({ id, label: id, series: timeline.map(time => ({ time, ...(points.get(time)?.finish() ?? empty) })) })) };
+  const empty = { calls: 0, input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: 0, market_cost: 0, cache_savings: 0, cache_reuse_ratio: null, cache_hit_ratio: null, unknown_usage_calls: 0, unknown_market_calls: 0, unknown_cost_calls: 0 };
+  return { bucket, series: timeline.map(time => ({ time, ...(totals.get(time)?.finish() ?? empty) })), modelSeries: [...models].sort(([a], [b]) => a.localeCompare(b)).map(([id, points]) => ({ id, label: labels.get(id)!, series: timeline.map(time => ({ time, ...(points.get(time)?.finish() ?? empty) })) })) };
 }
 export async function analytics(userId: string, query: unknown) {
   const f = FilterSchema.parse(query);
@@ -117,7 +128,11 @@ export async function analytics(userId: string, query: unknown) {
       notes: ["Recorded costs are provider-reported amounts or OpenCode estimates, not invoices. Market value excludes subscription fees.", "Totals normalize cache and reasoning overlap; partial measurements remain unavailable.", "Reuse is token-weighted provider-reported cache reuse, not a comparison of prompt contents.", "Unassigned historical accounts and keys are not inferred from provider names."] };
   });
   const groups = { model: base.modelGroups, provider: base.providerGroups, account: base.accountGroups, credential: base.credentialGroups, machine: base.machineGroups, agent: base.agentGroups }[f.groupBy];
-  return { ...base, groups };
+  const groupSeries = f.groupBy === "model" ? base.modelSeries : await cached(userId, `groupSeries:${f.groupBy}:${dataKey(f)}`, async () => {
+    const { records } = await facts(userId, f);
+    return series(records, base.timeframe.from, base.timeframe.to, f.groupBy).modelSeries;
+  });
+  return { ...base, groups, groupBy: f.groupBy, groupSeries };
 }
 export const sortExpressions: Record<string, string> = {
   observed_at: "e.observed_at", entity_id: "e.entity_id", machine: "e.machine",

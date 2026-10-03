@@ -2,6 +2,8 @@ import { test, expect } from "bun:test";
 import { normalizeUsage, tokenCost, chooseBucket, bucketTime, nextBucket, Aggregate, resolveMarket, outputHistogram, type UsageRecord } from "../apps/server/src/metrics.js";
 import { modelColor } from "../apps/web/src/UsageChart.js";
 import { usageChartData } from "../apps/web/src/chartData.js";
+import { groupColors } from "../apps/web/src/colors.js";
+import { seriesKey } from "../apps/web/src/chartMetrics.js";
 const lifecycle = { usageSource: "opencode", usageSemantics: "opencode-exclusive-input", inputTokens: 60, cacheReadTokens: 40, cacheWriteTokens: 0, outputTokens: 16, reasoningTokens: 4 };
 test("OpenCode and inclusive provider counters normalize to the same total without overlap", () => {
   const a = normalizeUsage(lifecycle), b = normalizeUsage({ usageSource: "provider", usageSemantics: "provider-inclusive-input", outputSemantics: "inclusive-reasoning", inputTokens: 100, cacheReadTokens: 40, cacheWriteTokens: 0, outputTokens: 20, reasoningTokens: 4 });
@@ -54,7 +56,28 @@ test("cumulative charts reconcile all models and Other, remain scoped, and carry
   const point=(time:number,value:number|null,unknown=0)=>({time,total_tokens:value,cost:value==null?null:value/100,market_cost:value==null?null:value/50,unknown_usage_calls:unknown,unknown_cost_calls:unknown,unknown_market_calls:unknown});
   const stats={timeframe:{from:5,to:35},series:[point(0,10),point(10,null,1),point(20,20),point(30,0)],modelSeries:[{id:"A",series:[point(0,6),point(10,null,1),point(20,12),point(30,0)]},{id:"B",series:[point(0,4),point(10,0),point(20,8),point(30,0)]}]};
   const data=usageChartData(stats,"total_tokens",["A"],true);
-  expect(data[0].time).toBe(5);expect(data[0].total).toBe(0);expect(data.at(-1)!.time).toBe(35);expect(data.at(-1)!.total).toBe(30);expect(data.at(-1)!.A).toBe(18);expect(data.at(-1)!.other).toBe(12);expect(data.at(-1)!.unknown).toBe(1);
+   expect(data[0].time).toBe(5);expect(data[0].total).toBe(0);expect(data.at(-1)!.time).toBe(35);expect(data.at(-1)!.total).toBe(30);expect(data.at(-1)![seriesKey("A")]).toBe(18);expect(data.at(-1)!.other).toBe(12);expect(data.at(-1)!.unknown).toBe(1);
   expect(usageChartData(stats,"cost",["A","B"],true).at(-1)!.total).toBeCloseTo(.3);
   expect(usageChartData(stats,"market_cost",["A"],false)[1].total).toBeNull();
+});
+test("grouped calls and arbitrary machine/account IDs are safe chart keys",()=>{
+  const a="work.station[0]",b="total";
+  const stats={timeframe:{from:0,to:20},series:[{time:0,calls:3,unknown_cost_calls:2},{time:10,calls:1}],groupSeries:[{id:a,series:[{calls:2},{calls:1}]},{id:b,series:[{calls:1},{calls:0}]}]};
+  const data=usageChartData(stats,"calls",[a,b],true),last=data.at(-1)!;
+  expect(last.total).toBe(4);expect(last[seriesKey(a)]).toBe(3);expect(last[seriesKey(b)]).toBe(1);expect(last.unknown).toBe(0);
+  expect(seriesKey(a)).not.toMatch(/[.\[\]]/);
+});
+test("provider color families have separated hues, distinct shades and stable filtered colors",()=>{
+  const groups=[{id:"google/antigravity-gemini",label:"Gemini",provider:"antigravity"},{id:"google/antigravity-claude",label:"Claude",provider:"antigravity"},{id:"openai/gpt",label:"GPT",provider:"openai"}];
+  const colors=groupColors(groups,"model"),hue=(id:string)=>Number(colors[id]!.match(/^hsl\((\d+)/)![1]);
+  expect(new Set(Object.values(colors)).size).toBe(3);
+  expect(Math.abs(hue(groups[0]!.id)-hue(groups[1]!.id))).toBeLessThanOrEqual(12);
+  expect(Math.abs(hue(groups[0]!.id)-hue(groups[2]!.id))).toBeGreaterThan(90);
+  expect(groupColors([groups[0]!],"model",groups)[groups[0]!.id]).toBe(colors[groups[0]!.id]);
+  expect(groupColors([...groups].reverse(),"model")).toEqual(colors);
+  const custom=[...groups,{id:"custom-a/model",label:"A",provider:"custom-a"},{id:"custom-b/model",label:"B",provider:"custom-b"}];
+  const providerGroups=[...new Set(custom.map(g=>g.provider))].map(id=>({id,label:id,provider:id}));
+  const providerColors=groupColors(providerGroups,"provider",custom);
+  expect(new Set(Object.values(providerColors)).size).toBe(providerGroups.length);
+  expect(groupColors([providerGroups[2]!],"provider",custom)[providerGroups[2]!.id]).toBe(providerColors[providerGroups[2]!.id]);
 });
