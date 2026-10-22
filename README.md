@@ -94,6 +94,21 @@ Add the plugin to your OpenCode configuration (`~/.config/opencode/opencode.json
 
 Restart OpenCode once so the plugin is loaded into your session.
 
+### OpenCode V2
+
+Use the V2 entrypoint when running OpenCode 2.x:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    "/absolute/path/to/opencode-observatory/packages/plugin/v2"
+  ]
+}
+```
+
+The V2 plugin keeps the same `observatory_setup`, `observatory_status`, and `observatory_usage` tools and the same local configuration. It captures attempt-level telemetry through the AI SDK language hook because V2's raw HTTP hooks do not fire for AISDK providers.
+
 ### Option A: Configure Directly Inside OpenCode (No Terminal Commands)
 Once the plugin is added, you can configure it directly inside your chat session with OpenCode:
 
