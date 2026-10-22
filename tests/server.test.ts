@@ -49,11 +49,129 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[laterLive]}});
     expect(Number((await app.inject({url:`/api/analytics?sessionId=${sessionId}`,headers:bearer(keyA)})).json().summary.input_tokens)).toBe(130);
   });
+  test("auxiliary usage is deduplicated only by matching parent, installation, provider and model",async()=>{
+    const sessionId=`ses_${randomUUID()}`,parent=`user_${randomUUID()}`,messageId=`msg_${randomUUID()}`;
+    const usage=event().data;
+    const message=event({sessionId,kind:"message",entityId:messageId,messageId,data:{...usage,parentMessageId:parent}});
+    const attempts=[
+      {},
+      {provider:"other"},
+      {model:"other"},
+    ].map(data=>event({sessionId,kind:"attempt",messageId:parent,data:{...usage,purpose:"auxiliary",...data}}));
+    const otherInstallation=event({sessionId,kind:"attempt",installationId:randomUUID(),messageId:parent,data:{...usage,purpose:"auxiliary"}});
+    const result=await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[message,...attempts,otherInstallation]}});
+    expect(result.statusCode).toBe(200);
+    const stats=await app.inject({url:`/api/analytics?sessionId=${sessionId}`,headers:bearer(keyA)});
+    expect(stats.statusCode).toBe(200);expect(stats.json().summary.calls).toBe(4);
+    // Updating the parent must update the indexed lookup too, restoring the unmatched attempt.
+    const updated=event({...message,eventId:randomUUID(),revision:message.revision+1,data:{...message.data,parentMessageId:"different-parent"}});
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[updated]}})).statusCode).toBe(200);
+    expect((await app.inject({url:`/api/analytics?sessionId=${sessionId}`,headers:bearer(keyA)})).json().summary.calls).toBe(5);
+  });
+  test("analytics component profiling preserves results and identifies cache-miss work",async()=>{
+    const {analytics}=await import("../apps/server/src/analytics.js");
+    const {invalidateAnalytics}=await import("../apps/server/src/cache.js");
+    const sessionId=`ses_${randomUUID()}`,step=event({sessionId});
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[step]}})).statusCode).toBe(200);
+    const query={sessionId,from:step.observedAt,to:step.observedAt+1000,groupBy:"provider"};
+    const expected=await analytics(userA,query);
+    invalidateAnalytics(userA);
+    const samples:import("../apps/server/src/analytics.js").AnalyticsProfile[]=[];
+    const actual=await analytics(userA,query,sample=>samples.push(sample));
+    expect(actual).toEqual(expected);
+    expect(samples.find(sample=>sample.component==="hourly buckets + exact boundaries")).toMatchObject({inputRecords:1,outputRecords:1});
+    expect(samples.find(sample=>sample.component==="bucket totals + breakdowns + charts")).toMatchObject({inputRecords:1,outputRecords:1});
+    expect(samples.every(sample=>sample.ms>=0)).toBe(true);
+    expect(samples.every(sample=>sample.startedAt>=0&&sample.cpuMs>=0&&Number.isFinite(sample.heapDeltaBytes))).toBe(true);
+    expect(samples.some(sample=>sample.component==="usage SQL + driver")).toBe(false);
+    const cachedSamples:unknown[]=[];
+    expect(await analytics(userA,query,sample=>cachedSamples.push(sample))).toEqual(expected);
+    expect(cachedSamples).toHaveLength(0);
+  });
   test("tenant-scoped APIs and PostgreSQL RLS prevent reads across users",async()=>{
     const result=await app.inject({url:`/api/analytics?sessionId=${sessionId}`,headers:bearer(keyB)});expect(result.json().summary.calls).toBe(0);
     expect((await app.inject({url:`/api/entities/step?sessionId=${sessionId}`,headers:bearer(keyB)})).json().total).toBe(0);
     const role=await pool.query("SELECT rolsuper,rolbypassrls FROM pg_roles WHERE rolname=current_user");expect(role.rows[0].rolsuper).toBe(false);expect(role.rows[0].rolbypassrls).toBe(false);
     const hidden=await tenant(userB,async(db:any)=>(await db.query("SELECT count(*)::int AS n FROM entities WHERE session_id=$1",[sessionId])).rows[0].n);expect(hidden).toBe(0);
+    for(const table of ["usage_facts","usage_hourly","usage_dirty","usage_rollup_state"]){
+      expect(await tenant(userB,async(db:any)=>(await db.query(`SELECT count(*)::int AS n FROM ${table} WHERE user_id=$1`,[userA])).rows[0].n)).toBe(0);
+    }
+  });
+  test("hourly analytics matches raw analytics across exact boundaries, filters, corrections and rebuilds",async()=>{
+    const {analytics,analyticsLegacy}=await import("../apps/server/src/analytics.js");
+    const {invalidateAnalytics}=await import("../apps/server/src/cache.js");
+    const {refreshUsage}=await import("../apps/server/src/rollups.js");
+    const sessionId=`ses_${randomUUID()}`,h=3600000,base=Math.floor(1700000000000/h)*h;
+    const steps=Array.from({length:10},(_,i)=>event({sessionId,observedAt:base+i*1300000+500,revision:base+i*1300000+1000,data:{...event().data,inputTokens:100+i,durationMs:10+i,agent:i%2?"plan":"build",...(i===9?{inputTokens:null,cost:null}:{}),...(i===8?{account:"test-account",authType:"oauth"}:{})}}));
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:steps}})).statusCode).toBe(200);
+    const equal=(a:any,b:any)=>{
+      if(typeof a==="number"&&typeof b==="number")expect(a).toBeCloseTo(b,8);
+      else if(a!==null&&b!==null&&typeof a==="object"&&typeof b==="object"){
+        expect(Object.keys(a).sort()).toEqual(Object.keys(b).sort());for(const key of Object.keys(b))equal(a[key],b[key]);
+      }else expect(a).toEqual(b);
+    };
+    const verify=async()=>{
+      for(const range of [{from:base,to:base+4*h},{from:base+123,to:base+h+456},{from:base+h+500,to:base+h+1500},{from:base-100*24*h,to:base+100*24*h},{to:base+4*h}]){
+        for(const filter of [{},{model:"test-model"},{account:"test-account"},{status:"completed"},{projectId:"prj_test"},{sessionId}]){
+          const q={...range,...filter,installationId:steps[0]!.installationId,groupBy:"provider"};
+          // Scope the unfiltered query to this fixture's unique machine.
+          const query={...q,machine:"rollup-fixture"};equal(await analytics(userA,query),await analyticsLegacy(userA,query));
+        }
+      }
+    };
+    const upload=async(events:any[])=>{expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:events.map(e=>({...e,machine:"rollup-fixture"}))}})).statusCode).toBe(200);};
+    await upload(steps.map(e=>({...e,eventId:randomUUID(),revision:e.revision+1})));await verify();
+    const changed=steps[0]!;
+    await upload([event({...changed,eventId:randomUUID(),revision:changed.revision+100,data:{...changed.data,model:"changed",inputTokens:900}})]);await verify();
+    await tenant(userA,async(db:any)=>{await db.query("DELETE FROM entities WHERE user_id=$1 AND installation_id=$2 AND kind='step' AND entity_id=$3",[userA,steps[1]!.installationId,steps[1]!.entityId]);});
+    invalidateAnalytics(userA);await verify();
+    await tenant(userA,async(db:any)=>{await db.query("UPDATE usage_hourly SET metrics[1]=metrics[1]+7 WHERE user_id=$1",[userA]);await refreshUsage(db,userA,true);});invalidateAnalytics(userA);await verify();
+  },30000);
+  test("fact triggers move contributions and roll back hourly changes atomically",async()=>{
+    const marker=new Error("rollback trigger test");
+    await expect(tenant(userA,async(db:any)=>{
+      const baseline=Number((await db.query("SELECT sum(metrics[1]) AS calls FROM usage_hourly WHERE user_id=$1",[userA])).rows[0].calls);
+      const row=(await db.query("SELECT installation_id,kind,entity_id FROM usage_facts WHERE user_id=$1 LIMIT 1",[userA])).rows[0];
+      const args=[userA,row.installation_id,row.kind,row.entity_id];
+      await db.query(`UPDATE usage_facts SET observed_at=observed_at+3600000,dimensions=jsonb_set(dimensions,'{machine}','"moved-by-trigger"') WHERE user_id=$1 AND installation_id=$2 AND kind=$3 AND entity_id=$4`,args);
+      expect(Number((await db.query("SELECT sum(metrics[1]) AS calls FROM usage_hourly WHERE user_id=$1 AND dimensions->>'machine'='moved-by-trigger'",[userA])).rows[0].calls)).toBe(1);
+      await db.query("DELETE FROM usage_facts WHERE user_id=$1 AND installation_id=$2 AND kind=$3 AND entity_id=$4",args);
+      expect(Number((await db.query("SELECT sum(metrics[1]) AS calls FROM usage_hourly WHERE user_id=$1",[userA])).rows[0].calls)).toBe(baseline-1);
+      throw marker;
+    })).rejects.toBe(marker);
+  });
+  test("deleting steps and messages restores the correct canonical fallback in full-hour buckets",async()=>{
+    const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
+    const sessionId=`ses_${randomUUID()}`,messageId=`msg_${randomUUID()}`,parent=`user_${randomUUID()}`,base=Math.floor(1700000000000/3600000)*3600000;
+    const data=event().data,message=event({sessionId,kind:"message",entityId:messageId,messageId,data:{...data,parentMessageId:parent}});
+    const auxiliary=event({sessionId,kind:"attempt",messageId:parent,data:{...data,purpose:"auxiliary",inputTokens:80}});
+    const step=event({sessionId,messageId,data:{...data,inputTokens:120}});
+    const query={machine:`fallback-${sessionId}`,from:base,to:base+3600000};
+    const summary=async()=>{invalidateAnalytics(userA);return(await analytics(userA,query)).summary;};
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[message,auxiliary,step].map(e=>({...e,machine:query.machine}))}})).statusCode).toBe(200);
+    expect((await summary()).input_tokens).toBe(120);
+    const remove=async(kind:string,id:string)=>tenant(userA,(db:any)=>db.query("DELETE FROM entities WHERE user_id=$1 AND installation_id=$2 AND kind=$3 AND entity_id=$4",[userA,step.installationId,kind,id]));
+    await remove("step",step.entityId);expect((await summary()).input_tokens).toBe(100);
+    await remove("message",message.entityId);expect((await summary()).input_tokens).toBe(80);
+    await remove("attempt",auxiliary.entityId);expect((await summary()).calls).toBe(0);
+  });
+  test("market catalog changes invalidate persisted usage valuation",async()=>{
+    const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
+    const sessionId=`ses_${randomUUID()}`,model=`catalog-${randomUUID()}`,step=event({sessionId,data:{...event().data,model}});
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[step]}})).statusCode).toBe(200);
+    const cost=async()=>{invalidateAnalytics(userA);return(await analytics(userA,{sessionId})).summary.market_cost;};
+    expect(await cost()).toBeNull();
+    try{
+      await pool.query("INSERT INTO market_rates VALUES($1,1,2,0.5,0)",[model]);expect(await cost()).toBeCloseTo(.000168,10);
+      await pool.query("UPDATE market_rates SET input=2 WHERE model_pattern=$1",[model]);expect(await cost()).toBeCloseTo(.000268,10);
+    }finally{await pool.query("DELETE FROM market_rates WHERE model_pattern=$1",[model]);}
+    expect(await cost()).toBeNull();
+  });
+  test("rollup dimension keys preserve escaped and Unicode metadata",async()=>{
+    const machine='quoted " \\ newline\n café',sessionId=`ses_${randomUUID()}`;
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[event({machine,sessionId})]}})).statusCode).toBe(200);
+    const result=await app.inject({url:`/api/analytics?machine=${encodeURIComponent(machine)}`,headers:bearer(keyA)});
+    expect(result.statusCode).toBe(200);expect(result.json().summary.calls).toBe(1);expect(result.json().machineGroups[0].id).toBe(machine);
   });
   test("pricing overrides select immutable effective rules and preserve original measurements",async()=>{
     const result=await app.inject({method:"POST",url:"/api/prices",headers:{...origin,cookie},payload:{provider:"openai",model:"test-model",effectiveAt:0,input:1,output:2,cacheRead:0.5,cacheWrite:0}});expect(result.statusCode).toBe(200);

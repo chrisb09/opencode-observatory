@@ -191,7 +191,7 @@ bun packages/plugin/dist/cli.js replay   # Reset acknowledged state to replay hi
 
 - **Row-Level Security (RLS):** Every database tenant query operates within a PostgreSQL transaction enforcing `user_id` row-level security. Database credentials used by the application cannot bypass RLS.
 - **Token Normalization:** Automatically reconciles differences between provider-reported inclusive prompt counters and OpenCode's exclusive counters.
-- **Fast Analytics:** Aggregations run through indexed lean facts passes with query-local JIT tuning and bounded tenant-isolated memory caches, delivering sub-100ms dashboard queries over thousands of canonical calls.
+- **Analytics:** Canonical usage facts feed automatically maintained hourly aggregates through PostgreSQL statement triggers. Totals, breakdowns, and charts combine these buckets with exact boundary facts, preserving missing-value and percentile semantics. Tenant-isolated caches avoid repeated work. See [rollup design, maintenance, and benchmarks](scripts/rollups.md).
 - **Reverse Proxy / LAN Deployment:** Set `PUBLIC_URL` in `.env` to your external URL (e.g. `http://192.168.1.148:7692` or `https://observatory.yourdomain.com`). This ensures secure cookie configuration and origin protection.
 
 ---
@@ -217,6 +217,35 @@ npm run test:browser
 # Run analytics performance benchmark against local database
 npm run benchmark:analytics
 ```
+
+The benchmark runs three samples per operation, explicitly clearing its own process-local
+cache before each uncached sample and immediately repeating the request to measure reuse.
+It covers 1/7/30/90-day and all-history analytics, representative filters, dimensions,
+machine inventory, and paginated listings. Output includes median/min/max function time,
+SQL/driver time and rows returned, repeat-query counts, JSON serialization time, and payload size.
+It reports returned item counts separately from matching calls/records, plus analytics
+component timings for shared fact loading, totals, charts, each breakdown, distributions,
+and transport/context statistics. Component work is observed on cache misses; exact
+cache hits skip those calculations. See [the measured baseline](scripts/analytics-baseline.md).
+The [physical clustering experiment](scripts/clustering-baseline.md) compares the
+same fixed workloads before and after clustering a disposable database copy.
+For detailed diagnostics of the retained raw implementation, run `node --import tsx scripts/profile-analytics-loading.ts`
+with `DATABASE_URL` configured (optionally `--only=all --rounds=3`). It separates
+normalization, SQL/driver work, server output formatting, wire volume, Node CPU,
+and reported GC activity. See [the loading profile](scripts/loading-profile-baseline.md)
+for measured results and interpretation of overlapping timings.
+It also checks how shifting a seven-day window by 1 ms affects cache reuse.
+
+```sh
+npm run benchmark:analytics -- --rounds=1
+npm run benchmark:analytics -- --only="machine inventory"
+```
+
+Measurements exclude HTTP and browser rendering; PostgreSQL buffers are not flushed.
+The benchmark selects the first administrator's tenant and only reads database data.
+It does not clear the running application's cache. Failed operations are reported and
+produce a nonzero exit status. With just three samples, use these as a diagnostic baseline,
+not a load-test percentile estimate.
 
 ---
 

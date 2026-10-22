@@ -1,79 +1,20 @@
 import { FilterSchema, providerGroup, type Filters } from "@observatory/contracts";
 import { tenant } from "./db.js";
 import { cached } from "./cache.js";
-import { Aggregate, normalizeUsage, number, tokenCost, resolveMarket, chooseBucket, bucketTime, nextBucket, percentile, outputHistogram, type UsageRecord, type Rates } from "./metrics.js";
+import { Aggregate, normalizeUsage, number, chooseBucket, bucketTime, nextBucket, percentile, outputHistogram, type UsageRecord } from "./metrics.js";
+import { where, columns, usageSQL, lookups, records, identityMatches } from "./usage.js";
+import { usageBuckets } from "./rollups.js";
+import { bucketAnalytics } from "./bucket-analytics.js";
 
-function where(f: Filters, base = "e", start = 2, identity = true) {
-  const values: unknown[] = [], conditions: string[] = [];
-  const add = (column: string, value: unknown, op = "=") => { values.push(value); conditions.push(`${column} ${op} $${start + values.length - 1}`); };
-  if (f.from !== undefined) add(`${base}.observed_at`, f.from, ">=");
-  if (f.to !== undefined) add(`${base}.observed_at`, f.to, "<");
-  if (f.provider === "antigravity") conditions.push(`(${base}.data->>'provider'='antigravity' OR (${base}.data->>'provider'='google' AND ${base}.data->>'model' LIKE 'antigravity-%'))`);
-  else if (f.provider) {
-    add(`${base}.data->>'provider'`, f.provider);
-    if (f.provider === "google") conditions.push(`COALESCE(${base}.data->>'model','') NOT LIKE 'antigravity-%'`);
-  }
-  for (const key of ["model", "status"] as const) if (f[key]) add(`${base}.data->>'${key}'`, f[key]);
-  if (identity) for (const key of ["account", "credential"] as const) if (f[key]) add(`${base}.data->>'${key}'`, f[key]);
-  if (f.machine) add(`${base}.machine`, f.machine);
-  if (f.sessionId) add(`${base}.session_id`, f.sessionId);
-  if (f.projectId) add(`${base}.project_id`, f.projectId);
-  if (f.installationId) add(`${base}.installation_id`, f.installationId);
-  return { sql: conditions.length ? " AND " + conditions.join(" AND ") : "", values };
-}
-const columns = "e.kind,e.entity_id,e.installation_id,e.session_id,e.message_id,e.machine,e.observed_at,e.revision,e.historical,e.data";
-// UNION ALL keeps the indexed step path independent of the message fallback anti-join.
-function usageSQL(w: ReturnType<typeof where>) {
-  return `SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='step' ${w.sql}
-    UNION ALL SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='message' AND e.data ? 'inputTokens' ${w.sql}
-      AND NOT EXISTS (SELECT 1 FROM entities s WHERE s.user_id=$1 AND s.installation_id=e.installation_id AND s.kind='step' AND s.message_id=e.entity_id)
-    UNION ALL SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='attempt' AND e.data->>'purpose'='auxiliary' ${w.sql}
-      AND NOT EXISTS (SELECT 1 FROM entities s WHERE s.user_id=$1 AND s.installation_id=e.installation_id AND s.kind='message'
-        AND s.data->>'parentMessageId'=e.message_id AND s.data->>'provider'=e.data->>'provider' AND s.data->>'model'=e.data->>'model')`;
-}
-type Assignment = { id: string; provider: string; installation_id: string | null; from_time: string; to_time: string | null; account: string; label: string };
-type Price = Rates & { id: string; provider: string; model: string; account: string | null; effective_at: string };
-type Lookup = { aliases: Map<string, string>; assignments: Assignment[]; prices: Price[]; catalog: Array<Rates & { model_pattern: string }> };
-async function lookups(db: any, userId: string): Promise<Lookup> {
-  const aliases = (await db.query("SELECT fingerprint,alias FROM account_aliases WHERE user_id=$1", [userId])).rows;
-  const assignments = (await db.query("SELECT * FROM account_assignments WHERE user_id=$1 ORDER BY (installation_id IS NOT NULL) DESC,from_time DESC,id", [userId])).rows;
-  const prices = (await db.query("SELECT * FROM prices WHERE user_id=$1 ORDER BY (account IS NOT NULL) DESC,effective_at DESC,id", [userId])).rows;
-  const catalog = (await db.query("SELECT * FROM market_rates ORDER BY model_pattern")).rows;
-  const rates = (r: any) => ({ ...r, input: Number(r.input), output: Number(r.output), cache_read: Number(r.cache_read), cache_write: Number(r.cache_write) });
-  return { aliases: new Map(aliases.map((a: any) => [a.fingerprint, a.alias])), assignments, prices: prices.map(rates), catalog: catalog.map(rates) };
-}
-function records(rows: any[], lookup: Lookup): UsageRecord[] {
-  const markets = new Map<string, Rates | null>();
-  return rows.map(row => {
-    const data = row.data, provider = data.provider ?? "Unknown", model = data.model ?? "Unknown", time = Number(row.observed_at);
-    const u = normalizeUsage(data);
-    const assignment = !data.account ? lookup.assignments.find(a => a.provider === provider && (!a.installation_id || a.installation_id === row.installation_id) && time >= Number(a.from_time) && (a.to_time === null || time < Number(a.to_time))) : undefined;
-    const account = data.account ?? assignment?.account ?? null, credential = data.credential ?? null;
-    const attribution = assignment ? "assigned" : account ? data.accountSource ?? (String(account).startsWith("hmac:") ? "observed" : "configured") : "unassigned";
-    const price = lookup.prices.find(p => p.provider === provider && p.model === model && (!p.account || p.account === account || p.account === credential) && Number(p.effective_at) <= time);
-    if (!markets.has(model)) markets.set(model, resolveMarket(model, lookup.catalog));
-    const rates = price ?? markets.get(model) ?? null;
-    const marketCost = rates ? tokenCost(u, rates) : null;
-    const cacheSavings = rates && u.cache_known && u.cache_read_tokens !== null ? u.cache_read_tokens * (rates.input - rates.cache_read) / 1000000 : null;
-    return { ...u, id: row.entity_id, installation: row.installation_id, session: row.session_id, provider, model, model_id: `${provider}/${model}`,
-      machine: row.machine, agent: data.agent ?? "Unknown", time, status: data.status ?? "unknown", duration: number(data.durationMs),
-      cost: number(data.cost), market_cost: marketCost, cache_savings: cacheSavings, historical: row.historical === true,
-       account_id: `${provider}/${account ?? "unassigned"}`, account_label: account ? lookup.aliases.get(account) ?? assignment?.label ?? (String(account).startsWith("hmac:") ? `Account ${String(account).slice(5, 13)}` : account) : "Account unassigned",
-      credential_id: `${provider}/${credential ?? (data.authType === "oauth" ? "oauth" : "unassigned")}`, credential_label: credential ? lookup.aliases.get(credential) ?? `Key ${String(credential).replace("hmac:", "").slice(0, 8)}` : data.authType === "oauth" ? "OAuth (no API key)" : "Key unavailable", credential_kind: credential ? "api-key" : data.authType === "oauth" ? "oauth" : "unavailable", attribution };
-  });
-}
-function identityMatches(r: UsageRecord, f: Filters) {
-  return (!f.account || r.account_id === f.account || r.account_id === `${r.provider}/${f.account}`) && (!f.credential || r.credential_id === f.credential || r.credential_id === `${r.provider}/${f.credential}`);
-}
 function dataKey(f: Filters) { const { groupBy, sortBy, sortDir, limit, offset, ...scope } = f; return JSON.stringify(scope); }
-async function facts(userId: string, f: Filters) {
+async function facts(userId: string, f: Filters, observer?: AnalyticsObserver) {
   return cached(userId, `facts:${dataKey(f)}`, () => tenant(userId, async db => {
     await db.query("SET LOCAL jit=off");
     await db.query("SET LOCAL statement_timeout='5s'");
     const w = where(f, "e", 2, false);
-    const rows = await db.query(usageSQL(w), [userId, ...w.values]);
-    const lookup = await lookups(db, userId);
-    return { records: records(rows.rows, lookup).filter(r => identityMatches(r, f)), lookup };
+    const rows = await profileLoad(observer, "usage SQL + driver", () => db.query(usageSQL(w), [userId, ...w.values]), value => value.rows.length);
+    const lookup = await profileLoad(observer, "usage lookups", () => lookups(db, userId), () => 1);
+    return { records: profile(observer, "usage normalization + identity filtering", rows.rows.length, () => records(rows.rows, lookup).filter(r => identityMatches(r, f)), value => value.length), lookup };
   }));
 }
 function groupIdentity(r: UsageRecord, type: Filters["groupBy"]) {
@@ -106,33 +47,68 @@ function series(records: UsageRecord[], from: number, to: number, type: Filters[
   const empty = { calls: 0, input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: 0, market_cost: 0, cache_savings: 0, cache_reuse_ratio: null, cache_hit_ratio: null, unknown_usage_calls: 0, unknown_market_calls: 0, unknown_cost_calls: 0 };
   return { bucket, series: timeline.map(time => ({ time, ...(totals.get(time)?.finish() ?? empty) })), modelSeries: [...models].sort(([a], [b]) => a.localeCompare(b)).map(([id, points]) => ({ id, label: labels.get(id)!, series: timeline.map(time => ({ time, ...(points.get(time)?.finish() ?? empty) })) })) };
 }
-export async function analytics(userId: string, query: unknown) {
+export type AnalyticsProfile = { component: string; ms: number; inputRecords: number; outputRecords: number; startedAt: number; cpuMs: number; heapDeltaBytes: number };
+export type AnalyticsObserver = (measurement: AnalyticsProfile) => void;
+function profile<T>(observer: AnalyticsObserver | undefined, component: string, inputRecords: number, run: () => T, count: (value: T) => number): T {
+  if (!observer) return run();
+  const cpu = process.cpuUsage(), heap = process.memoryUsage().heapUsed, start = performance.now(), value = run();
+  const elapsed = performance.now() - start, used = process.cpuUsage(cpu);
+  observer({ component, ms: elapsed, inputRecords, outputRecords: count(value), startedAt: start, cpuMs: (used.user + used.system) / 1000, heapDeltaBytes: process.memoryUsage().heapUsed - heap });
+  return value;
+}
+async function profileLoad<T>(observer: AnalyticsObserver | undefined, component: string, run: () => Promise<T>, count: (value: T) => number): Promise<T> {
+  if (!observer) return run();
+  const cpu = process.cpuUsage(), heap = process.memoryUsage().heapUsed, start = performance.now(), value = await run();
+  const elapsed = performance.now() - start, used = process.cpuUsage(cpu), size = count(value);
+  observer({ component, ms: elapsed, inputRecords: size, outputRecords: size, startedAt: start, cpuMs: (used.user + used.system) / 1000, heapDeltaBytes: process.memoryUsage().heapUsed - heap });
+  return value;
+}
+function transportStats(attempts: any[], ar: UsageRecord[]) {
+  const selectedIds = new Set(ar.map(r => `${r.installation}:${r.id}`));
+  const firstOutputs: number[] = [], ratios: number[] = [];
+  for (const a of attempts) if (selectedIds.has(`${a.installation_id}:${a.entity_id}`)) { const first = number(a.data.firstOutputMs); if (first !== null) firstOutputs.push(first); const u = normalizeUsage(a.data), limit = number(a.data.contextLimit); if (u.prompt_tokens !== null && limit && limit > 0) ratios.push(u.prompt_tokens / limit); }
+  firstOutputs.sort((a, b) => a - b); ratios.sort((a, b) => a - b);
+  const ranges = ["0–25%", "25–50%", "50–75%", "75–90%", "90–100%+"];
+  const context = ranges.map(range => ({ range, attempts: 0 })); for (const ratio of ratios) context[ratio < .25 ? 0 : ratio < .5 ? 1 : ratio < .75 ? 2 : ratio < .9 ? 3 : 4]!.attempts++;
+  return {
+    contextDistribution: context.filter(x => x.attempts > 0), contextPercentiles: { p50_ratio: percentile(ratios, .5), p95_ratio: percentile(ratios, .95) },
+    transport: { attempts: ar.length, failed: ar.filter(a => a.status === "failed").length, cancelled: ar.filter(a => a.status === "cancelled").length, first_output_ms: percentile(firstOutputs, .5) },
+  };
+}
+// Optional observer profiles work on cache misses; it never changes the API response.
+export async function analyticsLegacy(userId: string, query: unknown, observer?: AnalyticsObserver) {
   const f = FilterSchema.parse(query);
-  const base = await cached(userId, `analytics:${dataKey(f)}`, async () => {
-    const { records: rs, lookup } = await facts(userId, f);
-    const summary = new Aggregate(); for (const r of rs) summary.add(r, true);
+  const base = await cached(userId, `legacyAnalytics:${dataKey(f)}`, async () => {
+    const { records: rs } = await profileLoad(observer, "usage facts: load + normalize", () => facts(userId, f, observer), value => value.records.length);
+    const summary = profile(observer, "totals", rs.length, () => { const total = new Aggregate(); for (const r of rs) total.add(r, true); return total.finish(true); }, () => 1);
     const to = f.to ?? Date.now(), from = f.from ?? (rs.length ? rs.reduce((t,r)=>Math.min(t,r.time),to) : to - 7 * 86400000);
-    const chart = series(rs, from, to);
-    const {rows:attempts,records:ar}=await attemptFacts(userId,f);
-    const selectedIds = new Set(ar.map(r => `${r.installation}:${r.id}`));
-    const firstOutputs: number[] = [], ratios: number[] = [];
-    for (const a of attempts) if (selectedIds.has(`${a.installation_id}:${a.entity_id}`)) { const first = number(a.data.firstOutputMs); if (first !== null) firstOutputs.push(first); const u = normalizeUsage(a.data), limit = number(a.data.contextLimit); if (u.prompt_tokens !== null && limit && limit > 0) ratios.push(u.prompt_tokens / limit); }
-    firstOutputs.sort((a, b) => a - b); ratios.sort((a, b) => a - b);
-    const ranges = ["0–25%", "25–50%", "50–75%", "75–90%", "90–100%+"];
-    const context = ranges.map(range => ({ range, attempts: 0 })); for (const ratio of ratios) context[ratio < .25 ? 0 : ratio < .5 ? 1 : ratio < .75 ? 2 : ratio < .9 ? 3 : 4]!.attempts++;
-    return { summary: summary.finish(true), ...chart, modelGroups: group(rs, "model"), providerGroups: group(rs, "provider"), accountGroups: group(rs, "account"), credentialGroups: group(rs, "credential"), machineGroups: group(rs, "machine"), agentGroups: group(rs, "agent"),
-      outputDistribution: outputHistogram(rs.flatMap(r=>r.output_tokens === null ? [] : [r.output_tokens])),
-      contextDistribution: context.filter(x => x.attempts > 0), contextPercentiles: { p50_ratio: percentile(ratios, .5), p95_ratio: percentile(ratios, .95) },
-      transport: { attempts: ar.length, failed: ar.filter(a => a.status === "failed").length, cancelled: ar.filter(a => a.status === "cancelled").length, first_output_ms: percentile(firstOutputs, .5) },
+    const chart = profile(observer, "time series: totals + models", rs.length, () => series(rs, from, to), value => value.series.length + value.modelSeries.reduce((sum, model) => sum + model.series.length, 0));
+    const {rows:attempts,records:ar}=await profileLoad(observer, "attempt facts: load + correlate + normalize", () => attemptFacts(userId,f,observer), value => value.records.length);
+    const transport = profile(observer, "transport + context statistics", attempts.length, () => transportStats(attempts, ar), value => value.contextDistribution.length + 2);
+    const breakdown = (type: Filters["groupBy"]) => profile(observer, `breakdown: ${type}`, rs.length, () => group(rs, type), value => value.length);
+    return { summary, ...chart, modelGroups: breakdown("model"), providerGroups: breakdown("provider"), accountGroups: breakdown("account"), credentialGroups: breakdown("credential"), machineGroups: breakdown("machine"), agentGroups: breakdown("agent"),
+      outputDistribution: profile(observer, "output distribution", rs.length, () => outputHistogram(rs.flatMap(r=>r.output_tokens === null ? [] : [r.output_tokens])), value => value.length),
+      ...transport,
       timeframe: { from, to, timezone: "UTC", endExclusive: true, bucket: chart.bucket.unit },
       notes: ["Recorded costs are provider-reported amounts or OpenCode estimates, not invoices. Market value excludes subscription fees.", "Totals normalize cache and reasoning overlap; partial measurements remain unavailable.", "Reuse is token-weighted provider-reported cache reuse, not a comparison of prompt contents.", "Unassigned historical accounts and keys are not inferred from provider names."] };
   });
   const groups = { model: base.modelGroups, provider: base.providerGroups, account: base.accountGroups, credential: base.credentialGroups, machine: base.machineGroups, agent: base.agentGroups }[f.groupBy];
-  const groupSeries = f.groupBy === "model" ? base.modelSeries : await cached(userId, `groupSeries:${f.groupBy}:${dataKey(f)}`, async () => {
+  const groupSeries = f.groupBy === "model" ? base.modelSeries : await cached(userId, `legacyGroupSeries:${f.groupBy}:${dataKey(f)}`, async () => {
     const { records } = await facts(userId, f);
-    return series(records, base.timeframe.from, base.timeframe.to, f.groupBy).modelSeries;
+    return profile(observer, `time series: selected ${f.groupBy}`, records.length, () => series(records, base.timeframe.from, base.timeframe.to, f.groupBy).modelSeries, value => value.reduce((sum, item) => sum + item.series.length, 0));
   });
   return { ...base, groups, groupBy: f.groupBy, groupSeries };
+}
+export async function analytics(userId:string,query:unknown,observer?:AnalyticsObserver) {
+  const f=FilterSchema.parse(query);
+  return cached(userId,`hourlyAnalytics:${f.groupBy}:${dataKey(f)}`,async()=>{
+    const loaded=await profileLoad(observer,"hourly buckets + exact boundaries",()=>tenant(userId,db=>usageBuckets(db,userId,f)),value=>value.buckets.length);
+    const to=f.to??Date.now(),from=f.from??loaded.earliest??to-7*86400000;
+    const usage=profile(observer,"bucket totals + breakdowns + charts",loaded.buckets.length,()=>bucketAnalytics(loaded.buckets,from,to,f.groupBy),value=>value.summary.calls);
+    const attempts=await profileLoad(observer,"attempt facts: load + correlate + normalize",()=>attemptFacts(userId,f,observer),value=>value.records.length);
+    const transport=profile(observer,"transport + context statistics",attempts.rows.length,()=>transportStats(attempts.rows,attempts.records),value=>value.contextDistribution.length+2);
+    return {...usage,...transport,notes:["Recorded costs are provider-reported amounts or OpenCode estimates, not invoices. Market value excludes subscription fees.","Totals normalize cache and reasoning overlap; partial measurements remain unavailable.","Reuse is token-weighted provider-reported cache reuse, not a comparison of prompt contents.","Unassigned historical accounts and keys are not inferred from provider names."]};
+  });
 }
 export const sortExpressions: Record<string, string> = {
   observed_at: "e.observed_at", entity_id: "e.entity_id", machine: "e.machine",
@@ -207,21 +183,25 @@ async function entityPage(userId: string, kind: string, query: unknown) {
     return { items: rows.rows.map((row, i) => ({ ...row, data: { ...row.data, totalTokens: normalized[i]!.total_tokens, marketCost: normalized[i]!.market_cost, cacheReuseRatio: normalized[i]!.cache_known && normalized[i]!.prompt_tokens! > 0 ? normalized[i]!.cache_read_tokens! / normalized[i]!.prompt_tokens! : null } })), total: total.rows[0].count, limit: f.limit, offset: f.offset };
   });
 }
-async function attemptFacts(userId:string,f:Filters) {
+async function attemptFacts(userId:string,f:Filters,observer?:AnalyticsObserver) {
   return cached(userId,`attempts:${dataKey(f)}`,()=>tenant(userId,async db=>{
     await db.query("SET LOCAL jit=off");
-    const w=where(f,"e",2,false),lookup=await lookups(db,userId);
-    const rows=(await db.query(`SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='attempt' ${w.sql}`,[userId,...w.values])).rows;
-    const completed=rows.filter(row=>row.data.status==="completed"&&number(row.data.endedAt)!==null).map(row=>({installation_id:row.installation_id,session_id:row.session_id,message_id:row.message_id,entity_id:row.entity_id,provider:row.data.provider,model:row.data.model,account:row.data.account??null,end_time:Number(row.data.endedAt)}));
+    const w=where(f,"e",2,false),lookup=await profileLoad(observer,"attempt lookups",()=>lookups(db,userId),()=>1);
+    const rows=(await profileLoad(observer,"attempt SQL + driver",()=>db.query(`SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='attempt' ${w.sql}`,[userId,...w.values]),value=>value.rows.length)).rows;
+    // Precompute bounds: bigint arithmetic is not leakproof and would keep these
+    // range conditions out of the revision index scan under row-level security.
+    const completed=profile(observer,"prepare attempt correlation",rows.length,()=>rows.filter(row=>row.data.status==="completed"&&number(row.data.endedAt)!==null).map(row=>({installation_id:row.installation_id,session_id:row.session_id,message_id:row.message_id,entity_id:row.entity_id,provider:row.data.provider,model:row.data.model,account:row.data.account??null,window_from:Number(row.data.endedAt)-1000,window_to:Number(row.data.endedAt)+1000})),value=>value.length);
     if(completed.length){
-      const candidates=(await db.query(`SELECT s.data,s.entity_id,s.installation_id,p.entity_id AS attempt_id FROM entities s
+      const payload=profile(observer,"serialize attempt correlation input",completed.length,()=>JSON.stringify(completed),()=>completed.length);
+      const candidates=(await profileLoad(observer,"correlation SQL + driver",()=>db.query(`SELECT s.data,s.entity_id,s.installation_id,p.entity_id AS attempt_id FROM entities s
         JOIN entities m ON m.user_id=s.user_id AND m.installation_id=s.installation_id AND m.kind='message' AND m.entity_id=s.message_id
-        JOIN jsonb_to_recordset($2::jsonb) AS p(installation_id uuid,session_id text,message_id text,entity_id text,provider text,model text,account text,end_time bigint)
+        JOIN jsonb_to_recordset($2::jsonb) AS p(installation_id uuid,session_id text,message_id text,entity_id text,provider text,model text,account text,window_from bigint,window_to bigint)
         ON p.installation_id=s.installation_id AND p.session_id=s.session_id AND (p.message_id=s.message_id OR p.message_id=m.data->>'parentMessageId')
         AND p.provider=s.data->>'provider' AND p.model=s.data->>'model'
         AND (p.account IS NULL OR s.data->>'account' IS NULL OR p.account=s.data->>'account')
-        AND s.revision BETWEEN p.end_time-1000 AND p.end_time+1000
-        WHERE s.user_id=$1 AND s.kind='step' AND NOT s.historical AND s.data->>'status'='completed'`,[userId,JSON.stringify(completed)])).rows;
+        AND s.revision BETWEEN p.window_from AND p.window_to
+        WHERE s.user_id=$1 AND s.kind='step' AND NOT s.historical AND s.data->>'status'='completed'`,[userId,payload]),value=>value.rows.length)).rows;
+      profile(observer,"apply attempt correlation",rows.length,()=>{
       const byAttempt=new Map<string,any[]>(),byStep=new Map<string,number>();
       for(const candidate of candidates){const a=`${candidate.installation_id}:${candidate.attempt_id}`,s=`${candidate.installation_id}:${candidate.entity_id}`;if(!byAttempt.has(a))byAttempt.set(a,[]);byAttempt.get(a)!.push(candidate);byStep.set(s,(byStep.get(s)??0)+1);}
       for(const row of rows){
@@ -231,8 +211,10 @@ async function attemptFacts(userId:string,f:Filters) {
         const usage=Object.fromEntries(["inputTokens","outputTokens","reasoningTokens","cacheReadTokens","cacheWriteTokens","totalTokens","usageSource","usageSemantics","outputSemantics","cost","costSource"].filter(key=>step.data[key]!==undefined&&(!["cost","costSource"].includes(key)||number(row.data.cost)===null)).map(key=>[key,step.data[key]]));
         row.data={...row.data,...usage,usageProvenance:"lifecycle-correlated"};
       }
+      return rows;
+      },value=>value.length);
     }
-    return {rows,records:records(rows,lookup).filter(r=>identityMatches(r,f)),lookup};
+    return {rows,records:profile(observer,"attempt normalization + identity filtering",rows.length,()=>records(rows,lookup).filter(r=>identityMatches(r,f)),value=>value.length),lookup};
   }));
 }
 export async function listEntities(userId:string,kind:string,query:unknown) {
@@ -261,7 +243,7 @@ export async function listEntities(userId:string,kind:string,query:unknown) {
 export async function dimensions(userId: string) {
   return cached(userId, "dimensions", () => tenant(userId, async db => {
     await db.query("SET LOCAL jit=off");
-    const rows = (await db.query(`SELECT ${columns},e.project_id FROM entities e WHERE e.user_id=$1 AND e.kind IN ('step','message','attempt') AND e.data->>'provider' IS NOT NULL`, [userId])).rows;
+    const rows = (await db.query(`SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind IN ('step','message','attempt') AND e.data->>'provider' IS NOT NULL`, [userId])).rows;
     const lookup = await lookups(db, userId);
     const normalized=records(rows,lookup),unique=new Map<string,any>();
     rows.forEach((row,i)=>{const r=normalized[i]!;const value={provider:r.provider,model:r.model,account:r.attribution==="unassigned"?null:r.account_id.slice(r.provider.length+1),credential:row.data.credential??null,account_label:r.account_label,credential_label:r.credential_label,accountSource:r.attribution,authType:row.data.authType??null,machine:row.machine,installation_id:row.installation_id,project_id:row.project_id};unique.set(JSON.stringify(value),value);});

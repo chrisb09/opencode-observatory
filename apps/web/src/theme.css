@@ -148,6 +148,14 @@ header {
 .control-group > span { font-size: 11px; color: var(--muted); }
 .analytics-controls .segmented { display: flex; flex-wrap: wrap; }
 .charts-grid > .panel { min-width: 0; }
+.primary-charts > .panel { min-height: 460px; }
+.primary-charts { position: relative; }
+/* Keep the previous chart and legend geometry while a new grouping loads. */
+.charts-pending > .panel > * { visibility: hidden; }
+.charts-pending::after { content: "Loading charts…"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+.loading-line { position: fixed; top: 0; left: 0; right: 0; z-index: 50; margin: 0; }
+.chart-loading { display: flex; flex-direction: column; }
+.chart-placeholder { flex: 1; min-height: 290px; margin: 0 22px 22px; border-radius: 6px; background: repeating-linear-gradient(to bottom, transparent 0, transparent 59px, var(--border) 59px, var(--border) 60px); }
 .usage-panel .panel-title, .activity-panel .panel-title { padding-bottom: 12px; }
 .model-legend button { max-width: 100%; overflow-wrap: anywhere; text-align: left; }
 .chart-tooltip span { overflow-wrap: anywhere; }

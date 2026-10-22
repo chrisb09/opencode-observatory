@@ -1,10 +1,12 @@
 import { BatchSchema, type TelemetryEvent } from "@observatory/contracts";
 import { tenant } from "./db.js";
 import { invalidateAnalytics } from "./cache.js";
+import { lockUsage, refreshUsage } from "./rollups.js";
 
 export async function ingest(userId: string, payload: unknown) {
   const batch = BatchSchema.parse(payload);
   const result = await tenant(userId, async db => {
+    await lockUsage(db,userId);
     const acknowledged: string[] = [];
     for (const event of batch.events) {
       const inserted = await db.query("INSERT INTO events(user_id,event_id,installation_id,event) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING event_id", [userId, event.eventId, event.installationId, event]);
@@ -23,6 +25,7 @@ export async function ingest(userId: string, payload: unknown) {
       `, values(userId, event));
       acknowledged.push(event.eventId);
     }
+    await refreshUsage(db,userId);
     return { acknowledged, receivedAt: Date.now() };
   });
   invalidateAnalytics(userId);

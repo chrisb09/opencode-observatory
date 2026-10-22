@@ -58,7 +58,17 @@ export type UsageRecord = NormalizedUsage & {
   account_id: string; account_label: string; credential_id: string; credential_label: string; credential_kind?: "api-key" | "oauth" | "unavailable"; attribution: "observed" | "configured" | "assigned" | "unassigned";
   time: number; status: string; duration: number | null; cost: number | null; market_cost: number | null; cache_savings: number | null; historical: boolean;
 };
-const sums = ["input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens", "prompt_tokens", "completion_tokens", "total_tokens", "cost", "market_cost", "cache_savings"] as const;
+export const sums = ["input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens", "prompt_tokens", "completion_tokens", "total_tokens", "cost", "market_cost", "cache_savings"] as const;
+// Version 1: ten counters, then (sum, known-count) pairs for each metric,
+// followed by (market-minus-recorded sum, known-count). SQL enforces 34 entries.
+export function usageVector(r: UsageRecord) {
+  return [1, Number(r.status === "failed"), Number(r.historical), Number(r.cost === null), Number(r.market_cost === null), Number(r.total_tokens === null),
+    Number(r.cache_known), Number(r.cache_known && r.cache_read_tokens! > 0), r.cache_known ? r.prompt_tokens! : 0, r.cache_known ? r.cache_read_tokens! : 0,
+    ...sums.flatMap(key => [r[key] ?? 0, Number(r[key] !== null)]),
+    r.market_cost !== null && r.cost !== null ? r.market_cost-r.cost : 0, Number(r.market_cost !== null && r.cost !== null)];
+}
+export type UsageDimensions = Pick<UsageRecord,"installation"|"provider"|"model"|"model_id"|"machine"|"agent"|"status"|"historical"|"account_id"|"account_label"|"credential_id"|"credential_label"|"credential_kind"|"attribution"> & {project: string|null};
+export type UsageBucket = { time: number; dimensions: UsageDimensions; metrics: number[]; histogram: Record<string,number> };
 export class Aggregate {
   calls = 0; failures = 0; imported = 0; knownCache = 0; hitCalls = 0; knownPrompt = 0; cacheReads = 0; unknownCost = 0; unknownMarket = 0; unknownTotal = 0;
   values = Object.fromEntries(sums.map(k => [k, null])) as Record<typeof sums[number], number | null>;
@@ -72,6 +82,20 @@ export class Aggregate {
     if (r.attribution !== "unassigned") this.accounts.add(r.account_id);
     if (r.credential_kind === "api-key" || (!r.credential_kind && !r.credential_id.endsWith("/unassigned"))) this.keys.add(r.credential_id);
     if (distributions) { if (r.duration !== null) this.durations.push(r.duration); if (r.output_tokens !== null) this.outputs.push(r.output_tokens); }
+  }
+  addBucket(bucket: UsageBucket, distributions = false) {
+    const m=bucket.metrics,d=bucket.dimensions;
+    this.calls+=m[0]!;this.failures+=m[1]!;this.imported+=m[2]!;
+    this.unknownCost+=m[3]!;this.unknownMarket+=m[4]!;this.unknownTotal+=m[5]!;
+    this.knownCache+=m[6]!;this.hitCalls+=m[7]!;this.knownPrompt+=m[8]!;this.cacheReads+=m[9]!;
+    sums.forEach((key,i)=>{if(m[11+i*2]!>0)this.values[key]=(this.values[key]??0)+m[10+i*2]!;});
+    if(m[33]!>0)this.apiDifference=(this.apiDifference??0)+m[32]!;
+    if(d.attribution!=="unassigned")this.accounts.add(d.account_id);
+    if(d.credential_kind==="api-key"||(!d.credential_kind&&!d.credential_id.endsWith("/unassigned")))this.keys.add(d.credential_id);
+    if(distributions)for(const [key,count]of Object.entries(bucket.histogram)) {
+      const target=key.startsWith("d:")?this.durations:this.outputs,value=Number(key.slice(2));
+      for(let i=0;i<count;i++)target.push(value);
+    }
   }
   finish(distributions = false) {
     if (distributions) { this.durations.sort((a, b) => a - b); this.outputs.sort((a, b) => a - b); }

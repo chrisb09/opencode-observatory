@@ -1,4 +1,5 @@
 import pg from "pg";
+import { migrateRollups } from "./rollup-schema.js";
 export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
 export async function tenant<T>(userId: string, run: (db: pg.PoolClient) => Promise<T>): Promise<T> {
   const db = await pool.connect();
@@ -51,7 +52,13 @@ export async function migrate() {
       CREATE INDEX IF NOT EXISTS entities_session ON entities(user_id, installation_id, session_id, kind);
       CREATE INDEX IF NOT EXISTS entities_model ON entities(user_id, (data->>'provider'), (data->>'model'));
       CREATE INDEX IF NOT EXISTS entities_step_message ON entities(user_id,installation_id,message_id) WHERE kind='step';
-      CREATE INDEX IF NOT EXISTS entities_parent_message ON entities(user_id,installation_id,(data->>'parentMessageId')) WHERE kind='message';
+      -- JSON extraction is not leakproof, so RLS prevents a correlated lookup from
+      -- using a JSON expression as an index condition. A stored column keeps
+      -- the lookup indexable without weakening tenant isolation.
+      ALTER TABLE entities ADD COLUMN IF NOT EXISTS parent_message_id text GENERATED ALWAYS AS (data->>'parentMessageId') STORED;
+      CREATE INDEX IF NOT EXISTS entities_parent_message_lookup ON entities(user_id,installation_id,parent_message_id) WHERE kind='message';
+      -- Correlation probes a two-second revision window for each completed attempt.
+      CREATE INDEX IF NOT EXISTS entities_live_step_revision ON entities(user_id,installation_id,session_id,revision) WHERE kind='step' AND NOT historical;
       CREATE INDEX IF NOT EXISTS entities_account_time ON entities(user_id,(data->>'account'),observed_at) WHERE kind IN ('step','message','attempt');
       CREATE INDEX IF NOT EXISTS entities_key_time ON entities(user_id,(data->>'credential'),observed_at) WHERE kind IN ('step','message','attempt');
       CREATE INDEX IF NOT EXISTS events_received ON events(user_id, received_at);
@@ -121,10 +128,13 @@ export async function migrate() {
         ('hy4', 0.834, 2.501, 0.042, 0.834),
         ('muse-spark-1.3', 1.25, 4.25, 0.15, 1.25)
       ON CONFLICT(model_pattern) DO UPDATE SET
-        input=EXCLUDED.input, output=EXCLUDED.output, cache_read=EXCLUDED.cache_read, cache_write=EXCLUDED.cache_write;
+        input=EXCLUDED.input, output=EXCLUDED.output, cache_read=EXCLUDED.cache_read, cache_write=EXCLUDED.cache_write
+        WHERE (market_rates.input,market_rates.output,market_rates.cache_read,market_rates.cache_write)
+          IS DISTINCT FROM (EXCLUDED.input,EXCLUDED.output,EXCLUDED.cache_read,EXCLUDED.cache_write);
       GRANT SELECT ON market_rates TO PUBLIC;
     `);
-    for (const table of ["entities", "events", "account_aliases", "prices", "account_assignments"]) {
+    await migrateRollups(db);
+    for (const table of ["entities", "events", "account_aliases", "prices", "account_assignments", "usage_facts", "usage_hourly", "usage_dirty", "usage_rollup_state"]) {
       await db.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
       await db.query(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`);
       await db.query(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='${table}' AND policyname='tenant_isolation') THEN
