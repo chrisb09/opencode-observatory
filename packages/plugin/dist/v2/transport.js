@@ -7,7 +7,8 @@ function count(value) {
 }
 export async function accountData(ctx, collector, config, providerID) {
     try {
-        const connection = await ctx.integration.connection.active(providerID);
+        const integrationID = ctx.provider ? (await ctx.provider.get({ providerID })).data.integrationID ?? providerID : providerID;
+        const connection = await ctx.integration.connection.active(integrationID);
         const credential = connection ? await ctx.integration.connection.resolve(connection) : undefined;
         if (!credential)
             return { authType: null };

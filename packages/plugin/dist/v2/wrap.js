@@ -31,9 +31,15 @@ function extractUsage(usage) {
     };
 }
 export function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
-    const getMeta = () => {
-        const ctx = getMap(collector).get(modelKey);
-        const account = ctx ? collector.accounts.get(ctx.sessionID) : undefined;
+    const getMeta = (ctx, options) => {
+        let account = collector.accounts.get(ctx.sessionID);
+        const pinned = options.headers?.["x-opencode-router-account"];
+        if (providerID === "antigravity" && pinned && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(pinned)) {
+            // A routed account is request-scoped and does not activate the global
+            // credential. Attribute its account, but never invent its token fingerprint.
+            account = { account: pinned, credential: null, authType: "oauth", accountSource: "configured" };
+            collector.accounts.set(ctx.sessionID, account);
+        }
         return {
             provider: providerID || null,
             model: modelID || null,
@@ -42,21 +48,34 @@ export function wrapLanguageModel(inner, providerID, modelID, collector, modelKe
             ...(account ?? {}),
         };
     };
-    const getCtx = () => getMap(collector).get(modelKey);
+    const getCtx = (options) => {
+        const known = getMap(collector).get(modelKey);
+        if (!known)
+            return undefined;
+        const explicit = options.headers?.["x-opencode-session-id"];
+        if (!explicit)
+            return known;
+        return {
+            sessionID: explicit,
+            messageID: explicit === known.sessionID ? known.messageID : null,
+            agent: options.headers?.["x-opencode-router-agent"] ?? (explicit === known.sessionID ? known.agent : null),
+            variant: options.headers?.["x-opencode-router-model"]?.split("#")[1] ?? (explicit === known.sessionID ? known.variant : null),
+        };
+    };
     return {
         specificationVersion: "v3",
         provider: inner.provider,
         modelId: inner.modelId,
         supportedUrls: inner.supportedUrls,
         async doGenerate(options) {
-            const ctx = getCtx();
+            const ctx = getCtx(options);
             if (!ctx)
                 return inner.doGenerate(options); // no session context yet; skip attempt tracking
             const id = randomUUID();
             const { sessionID, messageID } = ctx;
             const startedAt = Date.now();
             const clock = performance.now();
-            const base = getMeta();
+            const base = getMeta(ctx, options);
             collector.record("attempt", id, { ...base, status: "running", startedAt, purpose: "chat" }, sessionID, messageID, false, startedAt, startedAt);
             try {
                 const result = await inner.doGenerate(options);
@@ -91,14 +110,14 @@ export function wrapLanguageModel(inner, providerID, modelID, collector, modelKe
             }
         },
         async doStream(options) {
-            const ctx = getCtx();
+            const ctx = getCtx(options);
             if (!ctx)
                 return inner.doStream(options); // no session context; skip attempt tracking
             const id = randomUUID();
             const { sessionID, messageID } = ctx;
             const startedAt = Date.now();
             const clock = performance.now();
-            const base = getMeta();
+            const base = getMeta(ctx, options);
             collector.record("attempt", id, { ...base, status: "running", startedAt, purpose: "chat" }, sessionID, messageID, false, startedAt, startedAt);
             let streamResult;
             try {

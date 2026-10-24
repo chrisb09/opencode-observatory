@@ -4867,7 +4867,8 @@ function count3(value) {
 }
 async function accountData(ctx, collector, config, providerID) {
   try {
-    const connection = await ctx.integration.connection.active(providerID);
+    const integrationID = ctx.provider ? (await ctx.provider.get({ providerID })).data.integrationID ?? providerID : providerID;
+    const connection = await ctx.integration.connection.active(integrationID);
     const credential = connection ? await ctx.integration.connection.resolve(connection) : void 0;
     if (!credential) return { authType: null };
     const metadata = credential.metadata ?? {};
@@ -5099,9 +5100,13 @@ function extractUsage(usage2) {
   };
 }
 function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
-  const getMeta = () => {
-    const ctx = getMap(collector).get(modelKey);
-    const account = ctx ? collector.accounts.get(ctx.sessionID) : void 0;
+  const getMeta = (ctx, options) => {
+    let account = collector.accounts.get(ctx.sessionID);
+    const pinned = options.headers?.["x-opencode-router-account"];
+    if (providerID === "antigravity" && pinned && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(pinned)) {
+      account = { account: pinned, credential: null, authType: "oauth", accountSource: "configured" };
+      collector.accounts.set(ctx.sessionID, account);
+    }
     return {
       provider: providerID || null,
       model: modelID || null,
@@ -5110,20 +5115,31 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
       ...account ?? {}
     };
   };
-  const getCtx = () => getMap(collector).get(modelKey);
+  const getCtx = (options) => {
+    const known = getMap(collector).get(modelKey);
+    if (!known) return void 0;
+    const explicit = options.headers?.["x-opencode-session-id"];
+    if (!explicit) return known;
+    return {
+      sessionID: explicit,
+      messageID: explicit === known.sessionID ? known.messageID : null,
+      agent: options.headers?.["x-opencode-router-agent"] ?? (explicit === known.sessionID ? known.agent : null),
+      variant: options.headers?.["x-opencode-router-model"]?.split("#")[1] ?? (explicit === known.sessionID ? known.variant : null)
+    };
+  };
   return {
     specificationVersion: "v3",
     provider: inner.provider,
     modelId: inner.modelId,
     supportedUrls: inner.supportedUrls,
     async doGenerate(options) {
-      const ctx = getCtx();
+      const ctx = getCtx(options);
       if (!ctx) return inner.doGenerate(options);
       const id2 = randomUUID4();
       const { sessionID, messageID } = ctx;
       const startedAt = Date.now();
       const clock = performance.now();
-      const base = getMeta();
+      const base = getMeta(ctx, options);
       collector.record(
         "attempt",
         id2,
@@ -5184,13 +5200,13 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
       }
     },
     async doStream(options) {
-      const ctx = getCtx();
+      const ctx = getCtx(options);
       if (!ctx) return inner.doStream(options);
       const id2 = randomUUID4();
       const { sessionID, messageID } = ctx;
       const startedAt = Date.now();
       const clock = performance.now();
-      const base = getMeta();
+      const base = getMeta(ctx, options);
       collector.record(
         "attempt",
         id2,

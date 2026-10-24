@@ -17,6 +17,7 @@ type Context = {
 };
 
 type PluginContext = {
+  provider?: { get(input: { providerID: string }): Promise<{ data: { integrationID?: string } }> };
   integration: {
     connection: {
       active(integrationID: string): Promise<{ type: string; id?: string; name?: string } | undefined>;
@@ -42,7 +43,8 @@ export async function accountData(
   providerID: string,
 ): Promise<Metadata> {
   try {
-    const connection = await ctx.integration.connection.active(providerID);
+    const integrationID = ctx.provider ? (await ctx.provider.get({ providerID })).data.integrationID ?? providerID : providerID;
+    const connection = await ctx.integration.connection.active(integrationID);
     const credential = connection ? await ctx.integration.connection.resolve(connection) : undefined;
     if (!credential) return { authType: null };
     const metadata = credential.metadata ?? {};

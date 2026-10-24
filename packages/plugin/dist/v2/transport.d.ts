@@ -2,6 +2,15 @@ import type { Metadata } from "@observatory/contracts";
 import type { ClientConfig } from "../config.js";
 import { Collector } from "../metadata.js";
 type PluginContext = {
+    provider?: {
+        get(input: {
+            providerID: string;
+        }): Promise<{
+            data: {
+                integrationID?: string;
+            };
+        }>;
+    };
     integration: {
         connection: {
             active(integrationID: string): Promise<{
