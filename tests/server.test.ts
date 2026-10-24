@@ -49,6 +49,18 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[laterLive]}});
     expect(Number((await app.inject({url:`/api/analytics?sessionId=${sessionId}`,headers:bearer(keyA)})).json().summary.input_tokens)).toBe(130);
   });
+  test("V2 recovery and live steps count each completed message once, excluding orphan running starts",async()=>{
+    const id=`ses_${randomUUID()}`,messageID=`msg_${randomUUID()}`,base=event().data;
+    const historical=event({sessionId:id,kind:"message",entityId:messageID,messageId:messageID,historical:true,data:base});
+    const orphan=event({sessionId:id,entityId:`${messageID}:step:old-start`,messageId:messageID,data:{status:"running",startedAt:100}});
+    const step=event({sessionId:id,entityId:`${messageID}:step`,messageId:messageID,data:base});
+    const post=async(events:any[])=>expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events}})).statusCode).toBe(200);
+    const summary=async()=>(await app.inject({url:`/api/analytics?sessionId=${id}`,headers:bearer(keyA)})).json().summary;
+    await post([historical]);expect((await summary()).calls).toBe(1);
+    await post([orphan]);expect((await summary()).calls).toBe(1);
+    await post([step]);expect((await summary()).calls).toBe(1);expect((await summary()).input_tokens).toBe(100);
+    await post([event({...historical,eventId:randomUUID()})]);expect((await summary()).calls).toBe(1);
+  });
   test("auxiliary usage is deduplicated only by matching parent, installation, provider and model",async()=>{
     const sessionId=`ses_${randomUUID()}`,parent=`user_${randomUUID()}`,messageId=`msg_${randomUUID()}`;
     const usage=event().data;

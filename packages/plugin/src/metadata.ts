@@ -59,7 +59,7 @@ export class Collector{
       startedAt: created,
       endedAt: updated,
       durationMs,
-      status: "completed",
+      status: info.status ?? "completed",
       agent: info.agent ?? null,
       provider: provider ?? null,
       model: model ?? null,

@@ -59,7 +59,8 @@ test("historical import checkpoints transactionally and rescans only changed ses
 });
 test("configureObservatory and in-session observatory_setup tool configure and activate telemetry on the fly",async()=>{
   const dir=await mkdtemp("/tmp/opencode/setup-test-");
-  const origXdg=process.env.XDG_CONFIG_HOME;process.env.XDG_CONFIG_HOME=dir;
+  const origXdg=process.env.XDG_CONFIG_HOME,origData=process.env.XDG_DATA_HOME;
+  process.env.XDG_CONFIG_HOME=dir;process.env.XDG_DATA_HOME=join(dir,"data");
   const { configureObservatory } = await import("../packages/plugin/src/config.js");
   const fakeServer=(async(input:any,init:any)=>{
     const url=String(input);
@@ -116,5 +117,6 @@ test("configureObservatory and in-session observatory_setup tool configure and a
   await clearConfig({ data: true });
 
   process.env.XDG_CONFIG_HOME=origXdg;
+  if(origData===undefined)delete process.env.XDG_DATA_HOME;else process.env.XDG_DATA_HOME=origData;
   await rm(dir,{recursive:true,force:true});
 });

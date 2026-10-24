@@ -3656,23 +3656,23 @@ var ZodEffects = class extends ZodType {
     }
     if (effect.type === "transform") {
       if (ctx.common.async === false) {
-        const base2 = this._def.schema._parseSync({
+        const base = this._def.schema._parseSync({
           data: ctx.data,
           path: ctx.path,
           parent: ctx
         });
-        if (!isValid(base2))
+        if (!isValid(base))
           return INVALID;
-        const result = effect.transform(base2.value, checkCtx);
+        const result = effect.transform(base.value, checkCtx);
         if (result instanceof Promise) {
           throw new Error(`Asynchronous transform encountered during synchronous parse operation. Use .parseAsync instead.`);
         }
         return { status: status.value, value: result };
       } else {
-        return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((base2) => {
-          if (!isValid(base2))
+        return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((base) => {
+          if (!isValid(base))
             return INVALID;
-          return Promise.resolve(effect.transform(base2.value, checkCtx)).then((result) => ({
+          return Promise.resolve(effect.transform(base.value, checkCtx)).then((result) => ({
             status: status.value,
             value: result
           }));
@@ -4349,7 +4349,7 @@ var Collector = class {
       startedAt: created,
       endedAt: updated,
       durationMs,
-      status: "completed",
+      status: info.status ?? "completed",
       agent: info.agent ?? null,
       provider: provider ?? null,
       model: model ?? null,
@@ -4381,16 +4381,16 @@ var Collector = class {
   part(part, historical = false, revision = Date.now()) {
     const message = this.messages.get(part.messageID), provider = message?.providerID ?? message?.model?.providerID, model = message?.modelID ?? message?.model?.modelID;
     const account = this.requestAccounts.get(`${part.sessionID}:${message?.parentID ?? part.messageID}:${provider}:${model}`) ?? this.accounts.get(part.sessionID);
-    const base2 = { provider: provider ?? null, model: model ?? null, agent: message?.agent ?? null, variant: message?.variant ?? null, ...!historical ? account : {} };
-    if (part.type === "step-finish") this.record("step", part.id, { ...base2, ...usage(part.tokens, part.cost), status: "completed", finishReason: part.reason ?? null, purpose: message?.summary ? "compaction" : "chat", startedAt: message?.time?.created ?? revision }, part.sessionID, part.messageID, historical, revision, message?.time?.created ?? revision);
+    const base = { provider: provider ?? null, model: model ?? null, agent: message?.agent ?? null, variant: message?.variant ?? null, ...!historical ? account : {} };
+    if (part.type === "step-finish") this.record("step", part.id, { ...base, ...usage(part.tokens, part.cost), status: "completed", finishReason: part.reason ?? null, purpose: message?.summary ? "compaction" : "chat", startedAt: message?.time?.created ?? revision }, part.sessionID, part.messageID, historical, revision, message?.time?.created ?? revision);
     if (part.type === "tool") {
       const state = part.state ?? {}, time = state.time;
-      this.record("tool", part.id, { ...base2, tool: String(part.tool).slice(0, 512), callId: part.callID, status: state.status === "error" ? "failed" : state.status === "completed" ? "completed" : "running", argumentBytes: size(state.input ?? {}), outputBytes: typeof state.output === "string" ? size(state.output) : null, startedAt: time?.start ?? revision, endedAt: time?.end ?? null, durationMs: time?.end ? Math.max(0, time.end - time.start) : null, ...state.error ? safeError({ message: state.error }) : {} }, part.sessionID, part.messageID, historical, revision, time?.start ?? revision);
+      this.record("tool", part.id, { ...base, tool: String(part.tool).slice(0, 512), callId: part.callID, status: state.status === "error" ? "failed" : state.status === "completed" ? "completed" : "running", argumentBytes: size(state.input ?? {}), outputBytes: typeof state.output === "string" ? size(state.output) : null, startedAt: time?.start ?? revision, endedAt: time?.end ?? null, durationMs: time?.end ? Math.max(0, time.end - time.start) : null, ...state.error ? safeError({ message: state.error }) : {} }, part.sessionID, part.messageID, historical, revision, time?.start ?? revision);
       for (const attachment of state.attachments ?? []) this.attachment(attachment, historical, revision, "tool");
     }
     if (part.type === "file") this.attachment(part, historical, revision);
-    if (part.type === "text" || part.type === "reasoning") this.record("text", part.id, { ...base2, ...part.type === "text" ? { textBytes: size(part.text ?? "") } : { reasoningBytes: size(part.text ?? "") }, startedAt: part.time?.start ?? revision, durationMs: part.time?.end ? Math.max(0, part.time.end - part.time.start) : null }, part.sessionID, part.messageID, historical, revision, part.time?.start ?? revision);
-    if (part.type === "retry") this.record("error", part.id, { ...base2, ...safeError(part.error) }, part.sessionID, part.messageID, historical, revision, part.time?.created ?? revision);
+    if (part.type === "text" || part.type === "reasoning") this.record("text", part.id, { ...base, ...part.type === "text" ? { textBytes: size(part.text ?? "") } : { reasoningBytes: size(part.text ?? "") }, startedAt: part.time?.start ?? revision, durationMs: part.time?.end ? Math.max(0, part.time.end - part.time.start) : null }, part.sessionID, part.messageID, historical, revision, part.time?.start ?? revision);
+    if (part.type === "retry") this.record("error", part.id, { ...base, ...safeError(part.error) }, part.sessionID, part.messageID, historical, revision, part.time?.created ?? revision);
   }
   attachment(part, historical, revision, source) {
     let bytes = null, width = null, height = null;
@@ -4529,38 +4529,75 @@ var Outbox = class {
   }
 };
 
-// src/history.ts
+// src/v2/history.ts
 import { Database as Database2 } from "bun:sqlite";
 import { resolve } from "node:path";
-async function importHistory(collector, outbox, path = collector.config.historyDatabase ?? historyPath(), options = {}) {
+function collectSession(collector, info, historical = false) {
+  collector.session({
+    ...info,
+    status: info.status ?? (info.outcome === "failed" ? "failed" : info.outcome === "interrupted" ? "cancelled" : info.time?.idle ? "completed" : "running")
+  }, historical);
+}
+function collectMessage(collector, sessionID, message, revision = message.time?.completed ?? message.time?.streamed ?? message.time?.created) {
+  if (message.type !== "assistant" && message.type !== "compaction") return;
+  collector.message({
+    ...message,
+    sessionID,
+    role: "assistant",
+    providerID: message.model?.providerID,
+    modelID: message.model?.id,
+    time: { ...message.time, completed: message.time?.completed ?? (message.type === "compaction" && message.status !== "running" ? revision : void 0) }
+  }, true, revision);
+  for (const [ordinal, content] of (message.content ?? []).entries()) {
+    const base = { sessionID, messageID: message.id, id: content.id ?? `${message.id}:${content.type}:${ordinal}` };
+    if (content.type === "tool") {
+      collector.part({ ...base, type: "tool", tool: content.name, callID: content.id, state: {
+        ...content.state,
+        output: content.state?.content ? JSON.stringify(content.state.content) : void 0,
+        time: { start: content.time?.ran ?? content.time?.created, end: content.time?.completed }
+      } }, true, revision);
+    } else if (content.type === "text" || content.type === "reasoning") {
+      collector.part({ ...base, type: content.type, text: content.text, time: {
+        start: content.time?.created ?? message.time?.created,
+        end: content.time?.completed ?? message.time?.streamed
+      } }, true, revision);
+    }
+  }
+  collector.messages.delete(message.id);
+}
+async function importV2History(collector, outbox, path = collector.config.historyDatabase ?? historyPath(), options = {}) {
   const db = new Database2(path, { readonly: true });
   let sessions = 0;
-  const source = resolve(path);
-  let cursor = options.all ? null : outbox.cursor(source);
-  const cols = new Set(db.query("PRAGMA table_info(session)").all().map((c) => c.name));
-  const has = (c) => cols.has(c) ? c : `NULL AS ${c}`;
-  const selectQuery = `SELECT id,project_id,parent_id,version,time_created,time_updated,${has("title")},${has("slug")},${has("agent")},${has("model")},${has("cost")},${has("tokens_input")},${has("tokens_output")},${has("tokens_reasoning")},${has("tokens_cache_read")},${has("tokens_cache_write")} FROM session WHERE (time_updated>? OR (time_updated=? AND id>?)) ORDER BY time_updated,id LIMIT 25`;
   try {
+    if (!db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='session_v2'").get()) return { sessions, ...outbox.health() };
+    const source = `${resolve(path)}:v2:${options.directory ?? "*"}`;
+    let cursor = options.all ? null : outbox.cursor(source);
+    const query = `SELECT * FROM session_v2 WHERE (time_updated>? OR (time_updated=? AND id>?)) ${options.directory ? "AND directory=?" : ""} ORDER BY time_updated,id LIMIT 25`;
     for (; ; ) {
-      const rows = db.query(selectQuery).all(cursor?.updated_at ?? 0, cursor?.updated_at ?? 0, cursor?.session_id ?? "");
+      if (options.signal?.aborted) break;
+      const params = [cursor?.updated_at ?? 0, cursor?.updated_at ?? 0, cursor?.session_id ?? ""];
+      if (options.directory) params.push(options.directory);
+      const rows = db.query(query).all(...params);
       if (!rows.length) break;
-      for (const session of rows) {
+      for (const row of rows) {
+        if (options.signal?.aborted) return { sessions, ...outbox.health() };
         db.transaction(() => outbox.db.transaction(() => {
-          collector.session(session, true, session.time_updated);
-          const messages = db.query("SELECT id,data,time_updated FROM message WHERE session_id=? ORDER BY time_created,id").all(session.id);
-          for (const row of messages) {
-            const info = { ...JSON.parse(row.data), id: row.id, sessionID: session.id };
-            collector.message(info, true, row.time_updated);
-            const parts = db.query("SELECT id,data,time_updated FROM part WHERE message_id=? ORDER BY time_created,id").all(row.id);
-            for (const part of parts) collector.part({ ...JSON.parse(part.data), id: part.id, messageID: row.id, sessionID: session.id }, true, part.time_updated);
-            collector.messages.delete(row.id);
-          }
-          outbox.checkpoint(source, session.time_updated, session.id);
+          collectSession(collector, {
+            ...row,
+            id: row.id,
+            outcome: row.idle_outcome,
+            time: { created: row.time_created, updated: row.time_updated, idle: row.time_idle }
+          }, true);
+          const messages = db.query("SELECT id,type,data,time_updated FROM session_message WHERE session_id=? ORDER BY seq,id").all(row.id);
+          for (const message of messages) collectMessage(collector, row.id, {
+            ...JSON.parse(message.data),
+            id: message.id,
+            type: message.type
+          }, message.time_updated);
+          outbox.checkpoint(source, row.time_updated, row.id);
         })())();
-        cursor = { updated_at: session.time_updated, session_id: session.id };
-        collector.sessions.delete(session.id);
+        cursor = { updated_at: row.time_updated, session_id: row.id };
         sessions++;
-        options.onProgress?.(sessions);
       }
       await new Promise((resolve2) => setTimeout(resolve2, 0));
     }
@@ -4651,240 +4688,113 @@ async function inventory(specs, directory, opencode) {
 }
 
 // src/v2/events.ts
-var contexts = /* @__PURE__ */ new WeakMap();
-function contextMap(collector) {
-  let map = contexts.get(collector);
-  if (!map) {
-    map = /* @__PURE__ */ new Map();
-    contexts.set(collector, map);
+var states = /* @__PURE__ */ new WeakMap();
+function stateOf(collector) {
+  let state = states.get(collector);
+  if (!state) {
+    state = { models: /* @__PURE__ */ new Map(), steps: /* @__PURE__ */ new Map(), tools: /* @__PURE__ */ new Map() };
+    states.set(collector, state);
   }
-  return map;
-}
-function payloadOf(event) {
-  return event.data ?? event.properties ?? {};
-}
-function ids(payload) {
-  return {
-    sessionID: typeof payload.sessionID === "string" ? payload.sessionID : null,
-    messageID: typeof payload.assistantMessageID === "string" ? payload.assistantMessageID : typeof payload.messageID === "string" ? payload.messageID : null
-  };
-}
-function base(payload, collector, sessionID, messageID) {
-  const map = contextMap(collector);
-  const known = (messageID ? map.get(`${sessionID}:${messageID}`) : void 0) ?? (sessionID ? map.get(`${sessionID}:*`) : void 0);
-  const account = sessionID ? collector.accounts.get(sessionID) : void 0;
-  return {
-    provider: payload.model?.providerID ?? known?.provider ?? null,
-    model: payload.model?.id ?? payload.modelID ?? payload.model?.modelID ?? known?.model ?? null,
-    agent: payload.agent ?? known?.agent ?? null,
-    variant: payload.model?.variant ?? known?.variant ?? null,
-    ...account ?? {}
-  };
-}
-function timestamp2(value) {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : void 0;
-}
-function duration(start, end) {
-  const from = timestamp2(start);
-  const to = timestamp2(end);
-  return from !== void 0 && to !== void 0 && to >= from ? to - from : null;
+  return state;
 }
 function observeEvent(event, collector) {
-  const payload = payloadOf(event);
+  const payload = event.data ?? event.properties ?? {};
   const type = event.type ?? "";
-  const now = timestamp2(event.created) ?? Date.now();
-  const { sessionID, messageID } = ids(payload);
-  const data = base(payload, collector, sessionID, messageID);
-  const map = contextMap(collector);
-  if (sessionID) {
-    if (payload.model || payload.agent) {
-      const entry = {
-        provider: data.provider ?? null,
-        model: data.model ?? null,
-        agent: data.agent ?? null,
-        variant: data.variant ?? null
-      };
-      if (messageID) map.set(`${sessionID}:${messageID}`, entry);
-      map.set(`${sessionID}:*`, entry);
-    }
+  const now = event.created ?? Date.now();
+  const sessionID = payload.sessionID ?? payload.info?.id;
+  if (!sessionID) return;
+  const messageID = payload.assistantMessageID ?? payload.messageID ?? null;
+  const state = stateOf(collector);
+  const contextKey = `${sessionID}:${messageID ?? "*"}`;
+  const known = state.models.get(contextKey) ?? state.models.get(`${sessionID}:*`);
+  const data = {
+    provider: payload.model?.providerID ?? known?.provider ?? null,
+    model: payload.model?.id ?? known?.model ?? null,
+    agent: payload.agent ?? known?.agent ?? null,
+    variant: payload.model?.variant ?? known?.variant ?? null,
+    ...collector.accounts.get(sessionID)
+  };
+  if (payload.model || payload.agent) {
+    state.models.set(contextKey, data);
+    state.models.set(`${sessionID}:*`, data);
   }
+  const record = (kind, id2, metadata) => collector.record(kind, id2, { ...data, ...metadata }, sessionID, messageID, false, now);
   switch (type) {
     case "session.created":
     case "session.updated":
-    case "session.forked":
     case "session.renamed": {
-      const info = payload.info ?? payload;
-      if (typeof info?.id === "string") collector.session(info);
+      const info = payload.info ?? { ...payload, id: sessionID, time: { created: now, updated: now } };
+      if (type !== "session.renamed" || payload.info) collectSession(collector, info);
       return;
     }
     case "session.step.started": {
-      if (!sessionID) return;
-      collector.record(
-        "step",
-        String(payload.id ?? payload.stepID ?? `${messageID ?? sessionID}:step:${now}`),
-        {
-          ...data,
-          status: "running",
-          startedAt: timestamp2(payload.started) ?? timestamp2(payload.time?.start) ?? now,
-          purpose: payload.purpose === "compaction" ? "compaction" : "chat"
-        },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
+      const id2 = `${messageID}:step`;
+      state.steps.set(contextKey, payload.started ?? now);
+      record("step", id2, { status: "running", startedAt: payload.started ?? now, purpose: "chat" });
       return;
     }
-    case "session.step.ended": {
-      if (!sessionID) return;
-      collector.record(
-        "step",
-        String(payload.id ?? payload.stepID ?? `${messageID ?? sessionID}:step:${now}`),
-        {
-          ...data,
-          ...payload.tokens ? {
-            inputTokens: typeof payload.tokens.input === "number" ? payload.tokens.input : null,
-            outputTokens: typeof payload.tokens.output === "number" ? payload.tokens.output : null,
-            reasoningTokens: typeof payload.tokens.reasoning === "number" ? payload.tokens.reasoning : null,
-            cacheReadTokens: typeof payload.tokens.cache?.read === "number" ? payload.tokens.cache.read : null,
-            cacheWriteTokens: typeof payload.tokens.cache?.write === "number" ? payload.tokens.cache.write : null,
-            usageSource: "opencode",
-            usageSemantics: "opencode-exclusive-input",
-            outputSemantics: "exclusive-reasoning"
-          } : {},
-          ...typeof payload.cost === "number" ? { cost: payload.cost, costSource: "opencode-estimate" } : {},
-          status: "completed",
-          finishReason: payload.finish ?? null,
-          startedAt: timestamp2(payload.started) ?? timestamp2(payload.time?.start),
-          endedAt: timestamp2(payload.time?.end) ?? now,
-          durationMs: duration(payload.started ?? payload.time?.start, payload.time?.end ?? now),
-          purpose: payload.purpose === "compaction" ? "compaction" : "chat"
-        },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
+    case "session.step.ended":
+    case "session.step.failed": {
+      const startedAt = state.steps.get(contextKey);
+      record("step", `${messageID}:step`, {
+        ...payload.tokens ? usage(payload.tokens, payload.cost) : {},
+        status: type.endsWith("failed") ? "failed" : "completed",
+        ...payload.error ? safeError(payload.error) : {},
+        finishReason: payload.finish ?? null,
+        startedAt,
+        endedAt: now,
+        durationMs: startedAt === void 0 ? null : Math.max(0, now - startedAt),
+        purpose: "chat"
+      });
+      state.steps.delete(contextKey);
       return;
     }
-    case "session.step.failed":
-    case "session.execution.failed": {
-      if (!sessionID) return;
-      collector.record(
-        "error",
-        String(payload.id ?? `${sessionID}:error:${now}`),
-        { ...data, ...safeError(payload.error ?? { message: payload.message }), status: "failed" },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
+    case "session.tool.input.started":
+      state.tools.set(`${contextKey}:${payload.id}`, { name: payload.name, started: now });
       return;
-    }
-    case "session.tool.called": {
-      if (!sessionID) return;
-      collector.record(
-        "tool",
-        String(payload.id ?? payload.callID ?? `${sessionID}:tool:${now}`),
-        {
-          ...data,
-          tool: String(payload.tool ?? payload.name ?? "unknown").slice(0, 512),
-          callId: payload.callID ?? payload.id,
-          status: "running",
-          argumentBytes: size(payload.input ?? {}),
-          startedAt: timestamp2(payload.time?.start) ?? now
-        },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
-      return;
-    }
-    case "session.tool.success": {
-      if (!sessionID) return;
-      collector.record(
-        "tool",
-        String(payload.id ?? payload.callID ?? `${sessionID}:tool:${now}`),
-        {
-          ...data,
-          tool: String(payload.tool ?? payload.name ?? "unknown").slice(0, 512),
-          callId: payload.callID ?? payload.id,
-          status: "completed",
-          argumentBytes: size(payload.input ?? {}),
-          outputBytes: typeof payload.output === "string" ? size(payload.output) : null,
-          startedAt: timestamp2(payload.time?.start),
-          endedAt: timestamp2(payload.time?.end) ?? now,
-          durationMs: duration(payload.time?.start, payload.time?.end ?? now)
-        },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
-      return;
-    }
+    case "session.tool.called":
+    case "session.tool.success":
     case "session.tool.failed": {
-      if (!sessionID) return;
-      collector.record(
-        "tool",
-        String(payload.id ?? payload.callID ?? `${sessionID}:tool:${now}`),
-        {
-          ...data,
-          tool: String(payload.tool ?? payload.name ?? "unknown").slice(0, 512),
-          callId: payload.callID ?? payload.id,
-          status: "failed",
-          argumentBytes: size(payload.input ?? {}),
-          ...safeError(payload.error ?? { message: payload.message }),
-          startedAt: timestamp2(payload.time?.start),
-          endedAt: timestamp2(payload.time?.end) ?? now,
-          durationMs: duration(payload.time?.start, payload.time?.end ?? now)
-        },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
+      const key = `${contextKey}:${payload.id}`;
+      const tool = state.tools.get(key) ?? { name: payload.name ?? "unknown", started: void 0, argumentBytes: void 0 };
+      if (type === "session.tool.called") {
+        tool.started = now;
+        tool.argumentBytes = size(payload.input ?? {});
+        state.tools.set(key, tool);
+      }
+      record("tool", payload.id, {
+        tool: tool.name.slice(0, 512),
+        callId: payload.id,
+        status: type.endsWith("called") ? "running" : type.endsWith("failed") ? "failed" : "completed",
+        argumentBytes: tool.argumentBytes ?? null,
+        outputBytes: payload.content ? size(payload.content) : null,
+        startedAt: tool.started,
+        ...type.endsWith("called") ? {} : { endedAt: now, durationMs: tool.started === void 0 ? null : Math.max(0, now - tool.started) },
+        ...payload.error ? safeError(payload.error) : {}
+      });
+      if (!type.endsWith("called")) state.tools.delete(key);
       return;
     }
     case "session.text.ended":
     case "session.reasoning.ended": {
-      if (!sessionID) return;
-      const reasoning = type.startsWith("session.reasoning");
-      collector.record(
-        "text",
-        String(payload.id ?? `${messageID ?? sessionID}:${reasoning ? "reasoning" : "text"}:${now}`),
-        {
-          ...data,
-          ...reasoning ? { reasoningBytes: size(payload.text ?? payload.delta ?? "") } : { textBytes: size(payload.text ?? payload.delta ?? "") },
-          startedAt: timestamp2(payload.time?.start),
-          durationMs: duration(payload.time?.start, payload.time?.end)
-        },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
+      const kind = type === "session.reasoning.ended" ? "reasoning" : "text";
+      record("text", `${messageID}:${kind}:${payload.ordinal ?? 0}`, {
+        ...kind === "reasoning" ? { reasoningBytes: size(payload.text ?? "") } : { textBytes: size(payload.text ?? "") }
+      });
       return;
     }
-    case "session.usage.updated":
-    case "session.usage.recorded": {
+    case "session.compaction.ended":
+      collector.record("message", event.id?.replace(/^evt_/, "msg_") ?? `${sessionID}:compaction:${now}`, {
+        ...data,
+        ...usage(payload.tokens, payload.cost),
+        purpose: "compaction",
+        status: "completed",
+        endedAt: now
+      }, sessionID, null, false, now);
       return;
-    }
-    case "session.retry.scheduled": {
-      if (!sessionID) return;
-      collector.record(
-        "error",
-        String(payload.id ?? `${sessionID}:retry:${now}`),
-        { ...data, ...safeError(payload.error ?? { message: "Retry scheduled" }), status: "failed" },
-        sessionID,
-        messageID,
-        false,
-        now
-      );
-      return;
-    }
-    default:
+    case "session.execution.failed":
+    case "session.retry.scheduled":
+      record("error", event.id ?? `${sessionID}:error:${now}`, { ...safeError(payload.error), status: "failed" });
       return;
   }
 }
@@ -4983,7 +4893,7 @@ async function accountData(ctx, collector, config, providerID) {
   return { authType: null };
 }
 function createTransportHooks(plugin, collector, config) {
-  const contexts2 = /* @__PURE__ */ new Map();
+  const contexts = /* @__PURE__ */ new Map();
   return {
     async request(event) {
       const active = collector();
@@ -5014,7 +4924,7 @@ function createTransportHooks(plugin, collector, config) {
         authType: data.authType ?? null,
         accountSource: data.accountSource
       });
-      contexts2.set(marker, {
+      contexts.set(marker, {
         collector: active,
         sessionID,
         messageID: typeof event.messageID === "string" ? event.messageID : null,
@@ -5026,7 +4936,7 @@ function createTransportHooks(plugin, collector, config) {
     },
     async response(event) {
       const marker = event.request?.headers?.get(CORRELATION);
-      const context = marker ? contexts2.get(marker) : void 0;
+      const context = marker ? contexts.get(marker) : void 0;
       if (!context) return;
       const response = event.response;
       context.data.headerMs = performance.now() - context.clock;
@@ -5053,7 +4963,7 @@ function createTransportHooks(plugin, collector, config) {
       };
       record();
       if (!response.body) {
-        contexts2.delete(marker);
+        contexts.delete(marker);
         return;
       }
       let sse = response.headers.get("content-type")?.toLowerCase().includes("text/event-stream") ?? false;
@@ -5124,7 +5034,7 @@ function createTransportHooks(plugin, collector, config) {
           }
         }
         record(status);
-        contexts2.delete(marker);
+        contexts.delete(marker);
       };
       const reader = response.body.getReader();
       const stream = new ReadableStream({
@@ -5157,7 +5067,7 @@ function createTransportHooks(plugin, collector, config) {
       });
     },
     clear() {
-      contexts2.clear();
+      contexts.clear();
     }
   };
 }
@@ -5213,11 +5123,11 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
       const { sessionID, messageID } = ctx;
       const startedAt = Date.now();
       const clock = performance.now();
-      const base2 = getMeta();
+      const base = getMeta();
       collector.record(
         "attempt",
         id2,
-        { ...base2, status: "running", startedAt, purpose: "chat" },
+        { ...base, status: "running", startedAt, purpose: "chat" },
         sessionID,
         messageID,
         false,
@@ -5232,7 +5142,7 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
           "attempt",
           id2,
           {
-            ...base2,
+            ...base,
             status: "completed",
             startedAt,
             endedAt,
@@ -5256,7 +5166,7 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
           "attempt",
           id2,
           {
-            ...base2,
+            ...base,
             ...safeError(error),
             status: "failed",
             startedAt,
@@ -5280,11 +5190,11 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
       const { sessionID, messageID } = ctx;
       const startedAt = Date.now();
       const clock = performance.now();
-      const base2 = getMeta();
+      const base = getMeta();
       collector.record(
         "attempt",
         id2,
-        { ...base2, status: "running", startedAt, purpose: "chat" },
+        { ...base, status: "running", startedAt, purpose: "chat" },
         sessionID,
         messageID,
         false,
@@ -5300,7 +5210,7 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
           "attempt",
           id2,
           {
-            ...base2,
+            ...base,
             ...safeError(error),
             status: "failed",
             startedAt,
@@ -5329,7 +5239,7 @@ function wrapLanguageModel(inner, providerID, modelID, collector, modelKey) {
           "attempt",
           id2,
           {
-            ...base2,
+            ...base,
             status,
             startedAt,
             endedAt,
@@ -5417,6 +5327,11 @@ var v2_default = Plugin.define({
     let collector = null;
     let outbox = null;
     let importTask;
+    let importStatus = "not started";
+    const controller = new AbortController();
+    const hydrated = /* @__PURE__ */ new Map();
+    const refreshed = /* @__PURE__ */ new Map();
+    const sessionStatus = /* @__PURE__ */ new Map();
     let runtime = {
       opencode: ctx.app.version,
       opencodeSource: "executable",
@@ -5428,12 +5343,44 @@ var v2_default = Plugin.define({
     const log = (message) => console.warn(`[opencode-observatory] ${message}`);
     try {
       const listed = await ctx.plugin.list().catch(() => void 0);
-      const specs = (listed?.data ?? []).map((item) => item?.source?.spec ?? item?.id ?? item?.name).filter((item) => typeof item === "string");
+      const specs = (Array.isArray(listed) ? listed : listed?.data ?? []).filter((item) => item?.source?.type !== "builtin").map((item) => item?.source?.spec ?? item?.source?.path ?? item?.id ?? item?.name).filter((item) => typeof item === "string");
       runtime = await inventory(specs, ctx.location.directory, ctx.app.version);
       runtime.opencodeSource = "executable";
     } catch {
     }
     const transport = createTransportHooks(ctx, () => collector, () => clientConfig);
+    const recover = () => {
+      if (!collector || !outbox) return Promise.resolve();
+      if (importTask) return importTask;
+      importStatus = "running";
+      importTask = importV2History(collector, outbox, void 0, {
+        directory: ctx.location.directory,
+        signal: controller.signal
+      }).then((result) => {
+        importStatus = result;
+      }).catch((error) => {
+        importStatus = "failed";
+        log(`V2 historical import failed: ${String(error)}`);
+      }).finally(() => {
+        importTask = void 0;
+      });
+      return importTask;
+    };
+    const hydrate = (sessionID, force = false) => {
+      if (!collector) return Promise.resolve(false);
+      if (!force && collector.sessions.has(sessionID) && Date.now() - (refreshed.get(sessionID) ?? 0) < 5e3) return Promise.resolve(true);
+      const pending = hydrated.get(sessionID);
+      if (pending) return pending;
+      const task = (async () => {
+        const info = await ctx.session.get({ sessionID });
+        if (info.location.directory !== ctx.location.directory || !collector) return false;
+        collectSession(collector, { ...info, status: sessionStatus.get(sessionID) });
+        refreshed.set(sessionID, Date.now());
+        return true;
+      })().finally(() => hydrated.delete(sessionID));
+      hydrated.set(sessionID, task);
+      return task;
+    };
     const startTelemetry = (next) => {
       clientConfig = next;
       if (!outbox) {
@@ -5441,17 +5388,34 @@ var v2_default = Plugin.define({
         collector = new Collector(next, runtime, (event) => outbox?.enqueue(event), ctx.location.project.id);
         outbox.start();
         if (next.autoImport && !importTask) {
-          importTask = importHistory(collector, outbox).catch(() => log("Historical import failed."));
+          void recover();
         }
       }
     };
     if (clientConfig) startTelemetry(clientConfig);
     else log("Not configured. Use the observatory_setup tool or run opencode-observatory setup.");
-    const controller = new AbortController();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          if (collector) observeEvent(event, collector);
+          if (!collector) continue;
+          const value = event;
+          const sessionID = value.data?.sessionID;
+          if (!sessionID) continue;
+          if (value.location?.directory && value.location.directory !== ctx.location.directory) continue;
+          try {
+            const statuses = {
+              "session.execution.started": "running",
+              "session.execution.succeeded": "completed",
+              "session.execution.failed": "failed",
+              "session.execution.interrupted": "cancelled"
+            };
+            if (statuses[value.type]) sessionStatus.set(sessionID, statuses[value.type]);
+            const lifecycle = /^session\.(created|renamed|moved|agent\.selected|model\.selected|usage\.updated|execution\.(started|succeeded|failed|interrupted))$/.test(value.type);
+            if (!await hydrate(sessionID, lifecycle)) continue;
+            if (!lifecycle) observeEvent(value, collector);
+          } catch (error) {
+            log(`Could not collect ${value.type}: ${String(error)}`);
+          }
         }
       } catch (error) {
         if (!controller.signal.aborted) log(`Event stream stopped: ${String(error)}`);
@@ -5461,6 +5425,8 @@ var v2_default = Plugin.define({
       const active = collector;
       const current = clientConfig;
       if (!active || !current) return;
+      sessionStatus.set(event.sessionID, "running");
+      await hydrate(event.sessionID).catch(() => false);
       const providerID = String(event.model.providerID);
       const modelID = String(event.model.id);
       const modelKey = `${providerID}:${modelID}`;
@@ -5548,8 +5514,18 @@ var v2_default = Plugin.define({
         input: { type: "object", properties: {}, additionalProperties: false },
         options: { codemode: false },
         execute: async () => ({
-          content: outbox ? JSON.stringify(outbox.health()) : "OpenCode Observatory is not configured yet. Run the 'observatory_setup' tool with your Observatory server URL and API key."
+          content: outbox ? JSON.stringify({ ...outbox.health(), history: importStatus }) : "OpenCode Observatory is not configured yet. Run the 'observatory_setup' tool with your Observatory server URL and API key."
         })
+      });
+      editor.add({
+        name: "observatory_import",
+        description: "Recover missing V2 session metadata and usage from OpenCode's persisted history without submitting prompts or inferring historical credentials.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        options: { codemode: false },
+        execute: async () => {
+          await recover();
+          return { content: JSON.stringify({ history: importStatus, ...outbox?.health() }) };
+        }
       });
       editor.add({
         name: "observatory_usage",
@@ -5572,6 +5548,7 @@ var v2_default = Plugin.define({
     });
     return async () => {
       controller.abort();
+      await Promise.allSettled(hydrated.values());
       transport.clear();
       if (importTask) await importTask;
       if (outbox) {

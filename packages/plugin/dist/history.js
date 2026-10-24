@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { resolve } from "node:path";
 import { historyPath } from "./config.js";
+import { importV2History } from "./v2/history.js";
 export async function importHistory(collector, outbox, path = collector.config.historyDatabase ?? historyPath(), options = {}) {
     const db = new Database(path, { readonly: true });
     let sessions = 0;
@@ -37,7 +38,8 @@ export async function importHistory(collector, outbox, path = collector.config.h
             // Yield to live requests between batches. Importing is local and does not depend on server availability.
             await new Promise(resolve => setTimeout(resolve, 0));
         }
-        return { sessions, ...outbox.health() };
+        const v2 = await importV2History(collector, outbox, path, options);
+        return { sessions: sessions + v2.sessions, ...outbox.health() };
     }
     finally {
         db.close();

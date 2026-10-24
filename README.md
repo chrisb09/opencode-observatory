@@ -107,7 +107,9 @@ Use the V2 entrypoint when running OpenCode 2.x:
 }
 ```
 
-The V2 plugin keeps the same `observatory_setup`, `observatory_status`, and `observatory_usage` tools and the same local configuration. It captures attempt-level telemetry through the AI SDK language hook because V2's raw HTTP hooks do not fire for AISDK providers.
+The V2 plugin keeps the same `observatory_setup`, `observatory_status`, and `observatory_usage` tools and the same local configuration. It also provides `observatory_import` to recover missing V2 sessions on demand. Live collection hydrates existing sessions and correlates V2 step and tool events using stable IDs. Attempt-level telemetry uses native HTTP hooks and the AI SDK language hook; providers using other transports still report canonical usage through lifecycle events.
+
+With auto-import enabled, startup recovery reads the current `session_v2` and `session_message` projections read-only, scoped to the plugin's location. `observatory_status` includes the recovery result. Configured plugins reload automatically in V2; `/reload` forces a reload if needed.
 
 ### Option A: Configure Directly Inside OpenCode (No Terminal Commands)
 Once the plugin is added, you can configure it directly inside your chat session with OpenCode:
@@ -180,6 +182,8 @@ Available MCP tools:
 
 ### Importing Past Sessions
 The historical importer reads OpenCode's local SQLite database (`opencode.db`) **read-only**, processes session snapshots, and enqueues sanitized metadata for delivery:
+
+The CLI supports both legacy tables and V2 projections, with separate transactional checkpoints. V2 recovery uses persisted message IDs and does not manufacture additional steps, so overlapping live telemetry and migrated V1 history are not counted twice. Historical account credentials are never inferred from the currently active account.
 
 ```sh
 # Incremental import (picks up new/updated sessions)

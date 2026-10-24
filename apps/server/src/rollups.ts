@@ -10,7 +10,7 @@ export async function lockUsage(db:PoolClient,userId:string) {
 // The source triggers track identities and their deduplication dependants. Refresh
 // canonical facts in the same ingest transaction; fact triggers maintain buckets.
 export async function refreshUsage(db:PoolClient,userId:string,force=false) {
-  const status=async()=> (await db.query(`SELECT s.ready,(s.catalog_revision=v.revision AND s.format_version=1) AS current,v.revision AS catalog_version,
+  const status=async()=> (await db.query(`SELECT s.ready,(s.catalog_revision=v.revision AND s.format_version=2) AS current,v.revision AS catalog_version,
     EXISTS(SELECT 1 FROM usage_dirty WHERE user_id=$1) AS dirty
     FROM usage_catalog_version v LEFT JOIN usage_rollup_state s ON s.user_id=$1`,[userId])).rows[0];
   let state=await status();
@@ -54,8 +54,8 @@ export async function refreshUsage(db:PoolClient,userId:string,force=false) {
       ORDER BY installation_id,kind,entity_id`,[userId,JSON.stringify(batch)]);
   }
   await db.query(`INSERT INTO usage_rollup_state(user_id,ready,catalog_revision,format_version,updated_at)
-    VALUES($1,true,$2,1,now())
-    ON CONFLICT(user_id) DO UPDATE SET ready=true,catalog_revision=EXCLUDED.catalog_revision,format_version=1,updated_at=now()`,[userId,state.catalog_version]);
+    VALUES($1,true,$2,2,now())
+    ON CONFLICT(user_id) DO UPDATE SET ready=true,catalog_revision=EXCLUDED.catalog_revision,format_version=2,updated_at=now()`,[userId,state.catalog_version]);
 }
 
 function dimensionFilter(f:Filters,values:unknown[]) {

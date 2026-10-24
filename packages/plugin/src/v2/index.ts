@@ -1,9 +1,9 @@
 import { Plugin } from "@opencode/plugin";
-import { COLLECTOR_VERSION, type Runtime } from "@observatory/contracts";
+import { COLLECTOR_VERSION, type Runtime, type Metadata } from "@observatory/contracts";
 import { api, clearConfig, configureObservatory, loadConfig, type ClientConfig } from "../config.js";
 import { Collector } from "../metadata.js";
 import { Outbox } from "../outbox.js";
-import { importHistory } from "../history.js";
+import { collectSession, importV2History } from "./history.js";
 import { inventory } from "../runtime.js";
 import { observeEvent } from "./events.js";
 import { accountData, createTransportHooks } from "./transport.js";
@@ -45,6 +45,12 @@ export default Plugin.define({
     let collector: Collector | null = null;
     let outbox: Outbox | null = null;
     let importTask: Promise<unknown> | undefined;
+    let importStatus: unknown = "not started";
+    const controller = new AbortController();
+    // Keep collection scoped to the session's actual location, even on shared servers.
+    const hydrated = new Map<string, Promise<boolean>>();
+    const refreshed = new Map<string, number>();
+    const sessionStatus = new Map<string, Metadata["status"]>();
     let runtime: Runtime = {
       opencode: ctx.app.version,
       opencodeSource: "executable",
@@ -58,8 +64,9 @@ export default Plugin.define({
 
     try {
       const listed = await ctx.plugin.list().catch(() => undefined);
-      const specs = ((listed as any)?.data ?? [])
-        .map((item: any) => item?.source?.spec ?? item?.id ?? item?.name)
+      const specs = (Array.isArray(listed) ? listed : (listed as any)?.data ?? [])
+        .filter((item: any) => item?.source?.type !== "builtin")
+        .map((item: any) => item?.source?.spec ?? item?.source?.path ?? item?.id ?? item?.name)
         .filter((item: unknown): item is string => typeof item === "string");
       runtime = await inventory(specs, ctx.location.directory, ctx.app.version);
       runtime.opencodeSource = "executable";
@@ -69,6 +76,36 @@ export default Plugin.define({
 
     const transport = createTransportHooks(ctx as any, () => collector, () => clientConfig);
 
+    const recover = () => {
+      if (!collector || !outbox) return Promise.resolve();
+      if (importTask) return importTask;
+      importStatus = "running";
+      importTask = importV2History(collector, outbox, undefined, {
+        directory: ctx.location.directory, signal: controller.signal,
+      }).then(result => { importStatus = result; }).catch(error => {
+        importStatus = "failed";
+        log(`V2 historical import failed: ${String(error)}`);
+      }).finally(() => { importTask = undefined; });
+      return importTask;
+    };
+
+    const hydrate = (sessionID: string, force = false): Promise<boolean> => {
+      if (!collector) return Promise.resolve(false);
+      if (!force && collector.sessions.has(sessionID) && Date.now() - (refreshed.get(sessionID) ?? 0) < 5000) return Promise.resolve(true);
+      const pending = hydrated.get(sessionID);
+      if (pending) return pending;
+      const task = (async () => {
+        const info = await ctx.session.get({ sessionID: sessionID as any });
+        // Event subscriptions are server-wide, not scoped to this plugin instance.
+        if (info.location.directory !== ctx.location.directory || !collector) return false;
+        collectSession(collector, { ...info, status: sessionStatus.get(sessionID) });
+        refreshed.set(sessionID, Date.now());
+        return true;
+      })().finally(() => hydrated.delete(sessionID));
+      hydrated.set(sessionID, task);
+      return task;
+    };
+
     const startTelemetry = (next: ClientConfig) => {
       clientConfig = next;
       if (!outbox) {
@@ -76,7 +113,7 @@ export default Plugin.define({
         collector = new Collector(next, runtime, (event) => outbox?.enqueue(event), ctx.location.project.id);
         outbox.start();
         if (next.autoImport && !importTask) {
-          importTask = importHistory(collector, outbox).catch(() => log("Historical import failed."));
+          void recover();
         }
       }
     };
@@ -84,11 +121,27 @@ export default Plugin.define({
     if (clientConfig) startTelemetry(clientConfig);
     else log("Not configured. Use the observatory_setup tool or run opencode-observatory setup.");
 
-    const controller = new AbortController();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-              if (collector) observeEvent(event as any, collector);
+          if (!collector) continue;
+          const value = event as any;
+          const sessionID = value.data?.sessionID;
+          if (!sessionID) continue;
+          if (value.location?.directory && value.location.directory !== ctx.location.directory) continue;
+          try {
+            const statuses: Record<string, Metadata["status"]> = {
+              "session.execution.started": "running", "session.execution.succeeded": "completed",
+              "session.execution.failed": "failed", "session.execution.interrupted": "cancelled",
+            };
+            if (statuses[value.type]) sessionStatus.set(sessionID, statuses[value.type]);
+            const lifecycle = /^session\.(created|renamed|moved|agent\.selected|model\.selected|usage\.updated|execution\.(started|succeeded|failed|interrupted))$/.test(value.type);
+            if (!await hydrate(sessionID, lifecycle)) continue;
+            // Lifecycle payloads are partial; hydrate already emitted the full snapshot.
+            if (!lifecycle) observeEvent(value, collector);
+          } catch (error) {
+            log(`Could not collect ${value.type}: ${String(error)}`);
+          }
         }
       } catch (error) {
         if (!controller.signal.aborted) log(`Event stream stopped: ${String(error)}`);
@@ -99,6 +152,8 @@ export default Plugin.define({
       const active = collector;
       const current = clientConfig;
       if (!active || !current) return;
+      sessionStatus.set(event.sessionID, "running");
+      await hydrate(event.sessionID).catch(() => false);
       const providerID = String(event.model.providerID);
       const modelID = String(event.model.id);
       const modelKey = `${providerID}:${modelID}`;
@@ -202,9 +257,20 @@ export default Plugin.define({
         options: { codemode: false },
         execute: async () => ({
           content: outbox
-            ? JSON.stringify(outbox.health())
+            ? JSON.stringify({ ...outbox.health(), history: importStatus })
             : "OpenCode Observatory is not configured yet. Run the 'observatory_setup' tool with your Observatory server URL and API key.",
         }),
+      });
+
+      editor.add({
+        name: "observatory_import",
+        description: "Recover missing V2 session metadata and usage from OpenCode's persisted history without submitting prompts or inferring historical credentials.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        options: { codemode: false },
+        execute: async () => {
+          await recover();
+          return { content: JSON.stringify({ history: importStatus, ...outbox?.health() }) };
+        },
       });
 
       editor.add({
@@ -232,6 +298,7 @@ export default Plugin.define({
 
     return async () => {
       controller.abort();
+      await Promise.allSettled(hydrated.values());
       transport.clear();
       if (importTask) await importTask;
       if (outbox) {

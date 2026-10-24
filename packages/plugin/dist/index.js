@@ -4359,7 +4359,7 @@ var Collector = class {
       startedAt: created,
       endedAt: updated,
       durationMs,
-      status: "completed",
+      status: info.status ?? "completed",
       agent: info.agent ?? null,
       provider: provider ?? null,
       model: model ?? null,
@@ -4656,12 +4656,92 @@ var Outbox = class {
 };
 
 // src/history.ts
+import { Database as Database3 } from "bun:sqlite";
+import { resolve as resolve2 } from "node:path";
+
+// src/v2/history.ts
 import { Database as Database2 } from "bun:sqlite";
 import { resolve } from "node:path";
-async function importHistory(collector, outbox, path = collector.config.historyDatabase ?? historyPath(), options = {}) {
+function collectSession(collector, info, historical = false) {
+  collector.session({
+    ...info,
+    status: info.status ?? (info.outcome === "failed" ? "failed" : info.outcome === "interrupted" ? "cancelled" : info.time?.idle ? "completed" : "running")
+  }, historical);
+}
+function collectMessage(collector, sessionID, message, revision = message.time?.completed ?? message.time?.streamed ?? message.time?.created) {
+  if (message.type !== "assistant" && message.type !== "compaction") return;
+  collector.message({
+    ...message,
+    sessionID,
+    role: "assistant",
+    providerID: message.model?.providerID,
+    modelID: message.model?.id,
+    time: { ...message.time, completed: message.time?.completed ?? (message.type === "compaction" && message.status !== "running" ? revision : void 0) }
+  }, true, revision);
+  for (const [ordinal, content] of (message.content ?? []).entries()) {
+    const base = { sessionID, messageID: message.id, id: content.id ?? `${message.id}:${content.type}:${ordinal}` };
+    if (content.type === "tool") {
+      collector.part({ ...base, type: "tool", tool: content.name, callID: content.id, state: {
+        ...content.state,
+        output: content.state?.content ? JSON.stringify(content.state.content) : void 0,
+        time: { start: content.time?.ran ?? content.time?.created, end: content.time?.completed }
+      } }, true, revision);
+    } else if (content.type === "text" || content.type === "reasoning") {
+      collector.part({ ...base, type: content.type, text: content.text, time: {
+        start: content.time?.created ?? message.time?.created,
+        end: content.time?.completed ?? message.time?.streamed
+      } }, true, revision);
+    }
+  }
+  collector.messages.delete(message.id);
+}
+async function importV2History(collector, outbox, path = collector.config.historyDatabase ?? historyPath(), options = {}) {
   const db = new Database2(path, { readonly: true });
   let sessions = 0;
-  const source = resolve(path);
+  try {
+    if (!db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='session_v2'").get()) return { sessions, ...outbox.health() };
+    const source = `${resolve(path)}:v2:${options.directory ?? "*"}`;
+    let cursor = options.all ? null : outbox.cursor(source);
+    const query = `SELECT * FROM session_v2 WHERE (time_updated>? OR (time_updated=? AND id>?)) ${options.directory ? "AND directory=?" : ""} ORDER BY time_updated,id LIMIT 25`;
+    for (; ; ) {
+      if (options.signal?.aborted) break;
+      const params = [cursor?.updated_at ?? 0, cursor?.updated_at ?? 0, cursor?.session_id ?? ""];
+      if (options.directory) params.push(options.directory);
+      const rows = db.query(query).all(...params);
+      if (!rows.length) break;
+      for (const row of rows) {
+        if (options.signal?.aborted) return { sessions, ...outbox.health() };
+        db.transaction(() => outbox.db.transaction(() => {
+          collectSession(collector, {
+            ...row,
+            id: row.id,
+            outcome: row.idle_outcome,
+            time: { created: row.time_created, updated: row.time_updated, idle: row.time_idle }
+          }, true);
+          const messages = db.query("SELECT id,type,data,time_updated FROM session_message WHERE session_id=? ORDER BY seq,id").all(row.id);
+          for (const message of messages) collectMessage(collector, row.id, {
+            ...JSON.parse(message.data),
+            id: message.id,
+            type: message.type
+          }, message.time_updated);
+          outbox.checkpoint(source, row.time_updated, row.id);
+        })())();
+        cursor = { updated_at: row.time_updated, session_id: row.id };
+        sessions++;
+      }
+      await new Promise((resolve3) => setTimeout(resolve3, 0));
+    }
+    return { sessions, ...outbox.health() };
+  } finally {
+    db.close();
+  }
+}
+
+// src/history.ts
+async function importHistory(collector, outbox, path = collector.config.historyDatabase ?? historyPath(), options = {}) {
+  const db = new Database3(path, { readonly: true });
+  let sessions = 0;
+  const source = resolve2(path);
   let cursor = options.all ? null : outbox.cursor(source);
   const cols = new Set(db.query("PRAGMA table_info(session)").all().map((c) => c.name));
   const has = (c) => cols.has(c) ? c : `NULL AS ${c}`;
@@ -4688,9 +4768,10 @@ async function importHistory(collector, outbox, path = collector.config.historyD
         sessions++;
         options.onProgress?.(sessions);
       }
-      await new Promise((resolve2) => setTimeout(resolve2, 0));
+      await new Promise((resolve3) => setTimeout(resolve3, 0));
     }
-    return { sessions, ...outbox.health() };
+    const v2 = await importV2History(collector, outbox, path, options);
+    return { sessions: sessions + v2.sessions, ...outbox.health() };
   } finally {
     db.close();
   }

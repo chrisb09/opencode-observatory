@@ -21,9 +21,9 @@ export function where(f: Filters, base = "e", start = 2, identity = true) {
 }
 export const columns = "e.kind,e.entity_id,e.installation_id,e.project_id,e.session_id,e.message_id,e.machine,e.observed_at,e.revision,e.historical,e.data";
 export function usageSQL(w: {sql:string}) {
-  return `SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='step' ${w.sql}
-    UNION ALL SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='message' AND e.data ? 'inputTokens' ${w.sql}
-      AND NOT EXISTS (SELECT 1 FROM entities s WHERE s.user_id=$1 AND s.installation_id=e.installation_id AND s.kind='step' AND s.message_id=e.entity_id)
+  return `SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='step' AND COALESCE(e.data->>'status','unknown')<>'running' ${w.sql}
+    UNION ALL SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='message' AND e.data ? 'inputTokens' AND COALESCE(e.data->>'status','unknown')<>'running' ${w.sql}
+      AND NOT EXISTS (SELECT 1 FROM entities s WHERE s.user_id=$1 AND s.installation_id=e.installation_id AND s.kind='step' AND s.message_id=e.entity_id AND COALESCE(s.data->>'status','unknown')<>'running')
     UNION ALL SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='attempt' AND e.data->>'purpose'='auxiliary' ${w.sql}
       AND NOT EXISTS (SELECT 1 FROM entities s WHERE s.user_id=$1 AND s.installation_id=e.installation_id AND s.kind='message'
         AND s.parent_message_id=e.message_id AND s.data->>'provider'=e.data->>'provider' AND s.data->>'model'=e.data->>'model')`;
