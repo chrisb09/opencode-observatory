@@ -111,6 +111,8 @@ The V2 plugin keeps the same `observatory_setup`, `observatory_status`, and `obs
 
 With auto-import enabled, startup recovery reads the current `session_v2` and `session_message` projections read-only, scoped to the plugin's location. `observatory_status` includes the recovery result. Configured plugins reload automatically in V2; `/reload` forces a reload if needed.
 
+Verify the target URL reported by `observatory_status` or the CLI `status` command matches the dashboard you actually use. A healthy localhost collector does not prove delivery to a separate production server. Reconnecting with only an API key preserves the configured server URL.
+
 ### Option A: Configure Directly Inside OpenCode (No Terminal Commands)
 Once the plugin is added, you can configure it directly inside your chat session with OpenCode:
 

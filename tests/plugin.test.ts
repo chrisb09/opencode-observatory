@@ -81,6 +81,8 @@ test("configureObservatory and in-session observatory_setup tool configure and a
   expect(res.config.apiKey).toBe("obs_valid_key");
   expect(res.hasReadScope).toBe(true);
   expect(res.message).toContain("OpenCode Observatory connected successfully");
+  const reconnect=await configureObservatory({apiKey:"obs_valid_key",fetcher:fakeServer});
+  expect(reconnect.config.url).toBe("http://127.0.0.1:9999");
 
   const origFetch = globalThis.fetch;
   globalThis.fetch = fakeServer;

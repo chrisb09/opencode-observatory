@@ -4215,7 +4215,8 @@ async function api(config, path, body, fetcher = fetch) {
   return response.json();
 }
 async function configureObservatory(options) {
-  let targetUrl = (options.url ?? "http://localhost:7692").trim();
+  const existing = await loadConfig();
+  let targetUrl = (options.url ?? existing?.url ?? "http://localhost:7692").trim();
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = `http://${targetUrl}`;
   targetUrl = targetUrl.replace(/\/+$/, "");
   const apiKey = options.apiKey.trim();
@@ -4237,7 +4238,6 @@ async function configureObservatory(options) {
   } catch (err) {
     throw new Error(`Authentication failed with Observatory at ${targetUrl}: ${err.message}. Verify your API key in Observatory Settings.`);
   }
-  const existing = await loadConfig();
   if (existing && existing.userId !== remote.userId) {
     throw new Error("This machine was previously configured for a different Observatory user. Clear or update the configuration directory to prevent sending data to a different account.");
   }
@@ -5514,7 +5514,7 @@ var v2_default = Plugin.define({
         input: { type: "object", properties: {}, additionalProperties: false },
         options: { codemode: false },
         execute: async () => ({
-          content: outbox ? JSON.stringify({ ...outbox.health(), history: importStatus }) : "OpenCode Observatory is not configured yet. Run the 'observatory_setup' tool with your Observatory server URL and API key."
+          content: outbox ? JSON.stringify({ url: clientConfig?.url, installationId: clientConfig?.installationId, ...outbox.health(), history: importStatus }) : "OpenCode Observatory is not configured yet. Run the 'observatory_setup' tool with your Observatory server URL and API key."
         })
       });
       editor.add({

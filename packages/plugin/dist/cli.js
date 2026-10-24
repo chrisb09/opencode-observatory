@@ -4111,7 +4111,8 @@ async function api(config, path, body, fetcher = fetch) {
   return response.json();
 }
 async function configureObservatory(options) {
-  let targetUrl = (options.url ?? "http://localhost:7692").trim();
+  const existing = await loadConfig();
+  let targetUrl = (options.url ?? existing?.url ?? "http://localhost:7692").trim();
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = `http://${targetUrl}`;
   targetUrl = targetUrl.replace(/\/+$/, "");
   const apiKey = options.apiKey.trim();
@@ -4133,7 +4134,6 @@ async function configureObservatory(options) {
   } catch (err) {
     throw new Error(`Authentication failed with Observatory at ${targetUrl}: ${err.message}. Verify your API key in Observatory Settings.`);
   }
-  const existing = await loadConfig();
   if (existing && existing.userId !== remote.userId) {
     throw new Error("This machine was previously configured for a different Observatory user. Clear or update the configuration directory to prevent sending data to a different account.");
   }
@@ -4793,7 +4793,7 @@ try {
       } else if (command === "replay") {
         outbox.replay();
         console.log("All retained metadata is pending again. Run flush to replay it.");
-      } else if (command === "status") console.log(JSON.stringify(outbox.health(), null, 2));
+      } else if (command === "status") console.log(JSON.stringify({ url: config.url, installationId: config.installationId, ...outbox.health() }, null, 2));
       else if (command === "mcp-config") console.log(JSON.stringify({ $schema: "https://opencode.ai/config.json", mcp: { servers: { observatory: { type: "remote", url: `${config.url.replace(/\/$/, "")}/mcp`, oauth: false, headers: { Authorization: "Bearer {env:OBSERVATORY_API_KEY}" } } } } }, null, 2));
       else throw new Error("Commands: setup, clear [--all], status, import [--all] [--database PATH], flush, replay, mcp-config");
     } finally {

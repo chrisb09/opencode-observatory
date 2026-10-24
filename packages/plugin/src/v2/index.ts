@@ -257,7 +257,7 @@ export default Plugin.define({
         options: { codemode: false },
         execute: async () => ({
           content: outbox
-            ? JSON.stringify({ ...outbox.health(), history: importStatus })
+            ? JSON.stringify({ url: clientConfig?.url, installationId: clientConfig?.installationId, ...outbox.health(), history: importStatus })
             : "OpenCode Observatory is not configured yet. Run the 'observatory_setup' tool with your Observatory server URL and API key.",
         }),
       });

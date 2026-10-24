@@ -125,6 +125,7 @@ test("V2 plugin hydrates an existing session and ignores events from other locat
       expect(records.some(record => record.kind === "session" && record.entityId === "ses_existing")).toBe(true);
       expect(records.some(record => record.sessionId === "ses_other")).toBe(false);
       expect(tools.has("observatory_import")).toBe(true);
+      expect(JSON.parse((await tools.get("observatory_status").execute({})).content).url).toBe("http://127.0.0.1:1");
     } finally { db.close(); }
   } finally {
     await cleanup?.();

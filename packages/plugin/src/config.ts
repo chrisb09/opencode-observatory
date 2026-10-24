@@ -49,7 +49,8 @@ export async function configureObservatory(options: {
   hasReadScope: boolean;
   message: string;
 }> {
-  let targetUrl = (options.url ?? "http://localhost:7692").trim();
+  const existing = await loadConfig();
+  let targetUrl = (options.url ?? existing?.url ?? "http://localhost:7692").trim();
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = `http://${targetUrl}`;
   targetUrl = targetUrl.replace(/\/+$/, "");
   const apiKey = options.apiKey.trim();
@@ -74,7 +75,6 @@ export async function configureObservatory(options: {
     throw new Error(`Authentication failed with Observatory at ${targetUrl}: ${(err as Error).message}. Verify your API key in Observatory Settings.`);
   }
 
-  const existing = await loadConfig();
   if (existing && existing.userId !== remote.userId) {
     throw new Error("This machine was previously configured for a different Observatory user. Clear or update the configuration directory to prevent sending data to a different account.");
   }
