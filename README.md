@@ -16,7 +16,7 @@ Multiple machines and developers can share one private Observatory instance whil
 
 ## Key Capabilities
 
-- **Zero Content Leakage:** Telemetry captures only metadata (token counts, models, latency, status, sanitized error categories, tool names, and byte counts). No prompt text, response content, reasoning output, code files, or provider API keys are ever transmitted.
+- **Metadata-Only by Default:** Telemetry captures only metadata (token counts, models, latency, status, sanitized error categories, tool names, and byte counts). Prompt text, response content, reasoning, code files, binary media, and provider API keys are not transmitted unless you explicitly opt into transcript capture (`contentMode`), which redacts credentials on the client and stores media as hashes and descriptions only.
 - **Adaptive Visual Analytics:** Interactive charts for Tokens, Recorded Cost, and Market Value (API-rate equivalent). Intervals automatically scale from 1-hour up to calendar months. Features smooth monotone curves and cumulative progression toggles.
 - **Accurate Token & Context Accounting:** Normalized token totals prevent double-counting across overlapping cache and reasoning fields. Dedicated **Context Reuse** metrics show token-weighted prompt cache hits, read/write volume, and estimated API savings.
 - **Granular Identity & Provider Breakdown:** Hierarchical exploration across Providers, Accounts, and Keys. Accurately distinguishes OAuth sessions from API-key access and allows explicit historical attribution for unattributed legacy sessions.
@@ -61,7 +61,7 @@ Start the PostgreSQL database and application:
 docker compose up -d --build
 ```
 
-- **Persistent Storage:** The PostgreSQL database is backed by the named Docker volume `pgdata` by default, preserving all telemetry, users, API keys, pricing overrides, and account assignments across restarts and updates. To use a custom host directory instead, set `PGDATA_SOURCE` in `.env` (e.g. `PGDATA_SOURCE=./data/postgres` or `PGDATA_SOURCE=/var/data/observatory`).
+- **Persistent Storage:** The PostgreSQL database is backed by the named Docker volume `pgdata` by default, preserving all telemetry, users, API keys, pricing overrides, and account assignments across restarts and updates. The per-tenant Git knowledge vaults live in the separate named volume `vaultdata` (`/data/vault` in the container). To use a custom host directory for PostgreSQL, set `PGDATA_SOURCE` in `.env` (e.g. `PGDATA_SOURCE=./data/postgres` or `PGDATA_SOURCE=/var/data/observatory`).
 - **Port Bindings:**
   - **7692:** Web Dashboard & API (accessible on `http://localhost:7692` or your local network IP).
   - **7693:** PostgreSQL (bound strictly to `127.0.0.1` for local inspection or backups).
@@ -155,7 +155,7 @@ bun x github:chrisb09/opencode-observatory clear --all
 When configured with a read-capable key, the plugin exposes tools directly in OpenCode:
 - `observatory_status`: Check local outbox delivery health and pending queue counts.
 - `observatory_usage`: Query centralized usage, model breakdowns, and token statistics across any timeframe.
-- `observatory_setup`: Connect, update, or disconnect (with `clear: true`) your Observatory connection on the fly.
+- `observatory_setup`: Connect, update, or disconnect (with `clear: true`) your Observatory connection on the fly. Accepts `contentMode: "off" | "text" | "full"` to opt into transcript capture.
 
 ### Model Context Protocol (MCP) Server
 To expose the full read-only analytics suite as MCP tools to OpenCode or Claude Desktop, generate your configuration:
@@ -177,6 +177,24 @@ Available MCP tools:
 - `request_attempts`
 - `tool_executions`
 - `error_breakdown`
+- Session memory: `search_sessions`, `session_transcript`, `session_summaries`
+- Knowledge vault: `vault_concepts`, `vault_claims`, `vault_conflicts`, `vault_note`, `vault_log`, `search_vault`
+
+### Session Memory & Knowledge Vault (Opt-in)
+
+Transcript capture is disabled by default. Enable it through `observatory_setup`:
+
+| Mode | Captured |
+| :--- | :--- |
+| `off` | Metadata only (default) |
+| `text` | Prompts, responses, reasoning, compaction, media descriptors |
+| `full` | `text` plus capped tool input/output (head + tail, 8 KB) |
+
+- **Client-side scrubbing:** Bearer tokens, `sk-…`, `obs_…`, GitHub/AWS/Slack/GitLab tokens, PEM private keys, `.env` assignments, JSON secret fields, and secret query parameters are replaced before text enters the local SQLite content queue.
+- **Media is never uploaded:** the client records a SHA-256 hash, MIME type, byte size, image dimensions when locally available, and an optional model-generated description. Historical `file://` attachments that no longer exist are marked `local_missing`.
+- **Cross-machine recall:** `search_sessions` searches scrubbed transcripts from every machine; `session_transcript` pages through parts and `session_summaries` returns model digests.
+- **Vault:** extracted claims carry a stable subject, scope (`global`, `project:<id>`, or `machine:<host>`), evidence tier, source validity time, and provenance down to session/message/part. The server folds them bitemporally, so an older session imported later from another machine cannot overwrite newer truth. Conflicting claims remain visible as `disputed` instead of being silently resolved.
+- **Git history:** one repository per tenant under `vaultdata`, rendered as Markdown concept notes with curated-prose regions. Commits carry `X-Observatory-Installation`, `-Machine`, `-Root-Session`, `-Evidence-Session`, `-Messages`, `-Agent`, `-Model`, and `-Prompt-Version` trailers for `git log`/`git blame` style provenance.
 
 ---
 

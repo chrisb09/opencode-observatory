@@ -17,6 +17,11 @@ const setupInput = {
     apiKey: { type: "string", description: "Observatory telemetry API key (starts with obs_)" },
     url: { type: "string", description: "Observatory server URL (defaults to http://localhost:7692)" },
     autoImport: { type: "boolean", description: "Import past sessions automatically" },
+    contentMode: {
+      type: "string",
+      enum: ["off", "text", "full"],
+      description: "Transcript capture: off (metadata only), text (prompts, responses, reasoning, media descriptors), or full (also capped tool input/output)",
+    },
     clear: { type: "boolean", description: "Disconnect Observatory and remove local configuration" },
     clearData: { type: "boolean", description: "Also delete the local outbox database when clearing" },
   },
@@ -108,9 +113,14 @@ export default Plugin.define({
 
     const startTelemetry = (next: ClientConfig) => {
       clientConfig = next;
+      if (collector && outbox) {
+        collector.config = next;
+        collector.contentSink = next.contentMode !== "off" ? part => outbox?.enqueueContent(part) : undefined;
+      }
       if (!outbox) {
         outbox = new Outbox(next);
         collector = new Collector(next, runtime, (event) => outbox?.enqueue(event), ctx.location.project.id);
+        if (next.contentMode !== "off") collector.contentSink = part => outbox?.enqueueContent(part);
         outbox.start();
         if (next.autoImport && !importTask) {
           void recover();
@@ -126,16 +136,18 @@ export default Plugin.define({
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           if (!collector) continue;
           const value = event as any;
-          const sessionID = value.data?.sessionID;
+          const payload = value.data ?? value.properties ?? {};
+          const sessionID = payload.sessionID ?? payload.info?.id;
           if (!sessionID) continue;
           if (value.location?.directory && value.location.directory !== ctx.location.directory) continue;
           try {
+            const type = String(value.type ?? "").replace(/^session\.next\./, "session.");
             const statuses: Record<string, Metadata["status"]> = {
               "session.execution.started": "running", "session.execution.succeeded": "completed",
               "session.execution.failed": "failed", "session.execution.interrupted": "cancelled",
             };
-            if (statuses[value.type]) sessionStatus.set(sessionID, statuses[value.type]);
-            const lifecycle = /^session\.(created|renamed|moved|agent\.selected|model\.selected|usage\.updated|execution\.(started|succeeded|failed|interrupted))$/.test(value.type);
+            if (statuses[type]) sessionStatus.set(sessionID, statuses[type]);
+            const lifecycle = /^session\.(created|renamed|moved|agent\.selected|model\.selected|usage\.updated|execution\.(started|succeeded|failed|interrupted))$/.test(type);
             if (!await hydrate(sessionID, lifecycle)) continue;
             // Lifecycle payloads are partial; hydrate already emitted the full snapshot.
             if (!lifecycle) observeEvent(value, collector);
@@ -213,6 +225,7 @@ export default Plugin.define({
             apiKey?: string;
             url?: string;
             autoImport?: boolean;
+            contentMode?: "off" | "text" | "full";
             clear?: boolean;
             clearData?: boolean;
           };
@@ -241,6 +254,7 @@ export default Plugin.define({
               url: args.url,
               apiKey: args.apiKey,
               autoImport: args.autoImport,
+              contentMode: args.contentMode,
             });
             startTelemetry(result.config);
             return { content: result.message };
@@ -304,6 +318,9 @@ export default Plugin.define({
       if (outbox) {
         try {
           await outbox.flush();
+        } catch {}
+        try {
+          await outbox.flushContent();
         } catch {}
         await outbox.close();
       }

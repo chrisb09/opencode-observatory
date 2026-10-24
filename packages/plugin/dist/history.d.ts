@@ -5,7 +5,9 @@ export declare function importHistory(collector: Collector, outbox: Outbox, path
     onProgress?: (sessions: number) => void;
 }): Promise<{
     pending: number;
+    pendingContent: number;
     acknowledged: number;
+    acknowledgedContent: number;
     lastError: string | null;
     sessions: number;
 }>;

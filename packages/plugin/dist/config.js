@@ -21,6 +21,7 @@ const ConfigSchema = z.object({
     schemaVersion: z.number().int().optional(),
     url: z.string().url(), apiKey: z.string().min(10), fingerprintSecret: z.string().min(20), userId: z.string().uuid(), installationId: z.string().uuid(),
     machine: z.string().min(1).max(256), autoImport: z.boolean().default(false), enableTools: z.boolean().default(true),
+    contentMode: z.enum(["off", "text", "full"]).default("off"),
     accounts: z.record(z.string()).default({}), historyDatabase: z.string().optional(),
 }).strict();
 export async function loadConfig() {
@@ -92,6 +93,8 @@ export async function configureObservatory(options) {
         accounts: existing?.accounts ?? {},
         autoImport: options.autoImport ?? existing?.autoImport ?? true,
         enableTools,
+        contentMode: options.contentMode ?? existing?.contentMode ?? "off",
+        ...(existing?.historyDatabase ? { historyDatabase: existing.historyDatabase } : {}),
     };
     await saveConfig(config);
     const message = [
@@ -102,6 +105,7 @@ export async function configureObservatory(options) {
         `• Ingestion: Active`,
         `• Query tools: ${enableTools ? "Enabled" : "Disabled (requires API key with read scope)"}`,
         `• Past sessions auto-import: ${config.autoImport ? "Enabled" : "Disabled"}`,
+        `• Transcript capture: ${config.contentMode === "off" ? "Disabled (metadata only)" : config.contentMode === "text" ? "Text only (no tool I/O)" : "Full (capped tool I/O)"}`,
     ].join("\n");
     return { config, hasReadScope, message };
 }

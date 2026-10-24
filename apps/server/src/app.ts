@@ -9,6 +9,8 @@ import { z, ZodError } from "zod";
 import { pool, tenant } from "./db.js";
 import { authenticate, browserUser, checkOrigin, createUser, decrypt, encrypt, hash, HttpError, passwordHash, passwordValid, token, validateSecurityConfig } from "./security.js";
 import { ingest } from "./ingest.js";
+import { storeContent, storeSummary } from "./memory.js";
+import { applyClaims, listVaultClaims, listVaultConcepts, listVaultConflicts, readVaultLog, readVaultNote } from "./vault-service.js";
 import { analytics, listEntities, dimensions, machines, errorBreakdown } from "./analytics.js";
 import { registerMcp } from "./mcp.js";
 import { invalidateAnalytics } from "./cache.js";
@@ -96,6 +98,16 @@ export async function buildApp(logger = true) {
     return {fingerprintSecret:decrypt(rows[0].fingerprint_secret),schemaVersion:1,userId:user.id};
   });
   app.post("/api/ingest",async request=>ingest((await authenticate(request,"ingest")).id,request.body));
+  // Transcript parts are larger than metadata events but still bounded. Clients
+  // send scrubbed text; media bytes are represented by hashes only.
+  app.post("/api/content",{bodyLimit:8*1024*1024},async request=>storeContent((await authenticate(request,"ingest")).id,request.body));
+  app.post("/api/summaries",{bodyLimit:1024*1024},async request=>storeSummary((await authenticate(request,"ingest")).id,request.body));
+  app.post("/api/vault/claims",{bodyLimit:1024*1024},async request=>applyClaims((await authenticate(request,"ingest")).id,request.body));
+  app.get("/api/vault/concepts",async request=>listVaultConcepts((await authenticate(request,"read")).id));
+  app.get("/api/vault/claims",async request=>listVaultClaims((await authenticate(request,"read")).id,request.query));
+  app.get("/api/vault/conflicts",async request=>listVaultConflicts((await authenticate(request,"read")).id,request.query));
+  app.get("/api/vault/note",async request=>readVaultNote((await authenticate(request,"read")).id,request.query));
+  app.get("/api/vault/log",async request=>readVaultLog((await authenticate(request,"read")).id,request.query));
   app.get("/api/analytics",async request=>analytics((await authenticate(request,"read")).id,request.query));
   app.get("/api/dimensions",async request=>dimensions((await authenticate(request,"read")).id));
   app.get("/api/machines",async request=>machines((await authenticate(request,"read")).id));

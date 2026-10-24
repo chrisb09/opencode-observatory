@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { makeContentPart, mediaFromPart, mediaMarker } from "./content.js";
 export const size = (value) => Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value) ?? "");
 const num = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
 export const fingerprint = (secret, value) => `hmac:${createHmac("sha256", secret).update(value).digest("hex")}`;
@@ -27,6 +28,7 @@ export class Collector {
     sessions = new Map();
     accounts = new Map();
     requestAccounts = new Map();
+    contentSink;
     constructor(config, runtime, emit, projectId = null) {
         this.config = config;
         this.runtime = runtime;
@@ -37,6 +39,51 @@ export class Collector {
         const session = sessionId ? this.sessions.get(sessionId) : undefined;
         this.emit({ schemaVersion: 1, eventId: randomUUID(), installationId: this.config.installationId, instanceId: this.instanceId, machine: this.config.machine, projectId: session?.projectId ?? this.projectId, sessionId, messageId, kind, entityId, revision, observedAt, historical,
             runtime: historical ? { ...this.runtime, opencode: null, provenance: "import-current" } : this.runtime, data: { coverage: historical ? "historical" : "lifecycle", ...data } });
+    }
+    content(input) {
+        if (!this.contentSink || this.config.contentMode === "off")
+            return;
+        this.contentSink(makeContentPart({ installationId: this.config.installationId, ...input }));
+    }
+    contentAttachment(sessionId, messageId, part, observedAt, role = "tool") {
+        if (!this.contentSink || this.config.contentMode === "off")
+            return;
+        const media = mediaFromPart(part);
+        if (!media)
+            return;
+        const partId = String(part?.id ?? `${messageId}:media:${media.contentHash.slice(7, 19)}`);
+        this.content({ sessionId, messageId, partId, kind: "media", role, text: mediaMarker(media), observedAt, media });
+    }
+    capturePart(part, message, revision) {
+        if (!this.contentSink || this.config.contentMode === "off")
+            return;
+        const sessionId = part.sessionID ?? message?.sessionID ?? null, messageId = part.messageID ?? message?.id ?? null;
+        if (!sessionId || !messageId)
+            return;
+        const role = message?.role === "user" ? "user" : "assistant";
+        const partId = String(part.id ?? `${messageId}:${part.type ?? "part"}`);
+        const observedAt = part.time?.start ?? part.time?.created ?? message?.time?.created ?? revision;
+        if (part.type === "text") {
+            if (part.synthetic || part.ignored)
+                return;
+            this.content({ sessionId, messageId, partId, kind: role === "user" ? "prompt" : "response", role, text: String(part.text ?? ""), observedAt });
+        }
+        else if (part.type === "reasoning") {
+            this.content({ sessionId, messageId, partId, kind: "reasoning", role: "assistant", text: String(part.text ?? ""), observedAt });
+        }
+        else if (part.type === "tool") {
+            if (this.config.contentMode === "full") {
+                const input = part.state?.input;
+                this.content({ sessionId, messageId, partId: `${partId}:input`, kind: "tool_input", role: "assistant", text: typeof input === "string" ? input : JSON.stringify(input ?? {}), observedAt });
+                const output = part.state?.output ?? part.state?.content;
+                this.content({ sessionId, messageId, partId: `${partId}:output`, kind: "tool_output", role: "tool", text: typeof output === "string" ? output : JSON.stringify(output ?? ""), observedAt });
+            }
+            for (const attachment of part.state?.attachments ?? [])
+                this.contentAttachment(sessionId, messageId, attachment, observedAt);
+        }
+        else if (part.type === "file") {
+            this.contentAttachment(sessionId, messageId, part, observedAt, role);
+        }
     }
     session(info, historical = false, revision = info.time?.updated ?? info.time_updated ?? Date.now()) {
         this.sessions.set(info.id, { projectId: info.projectID ?? info.project_id ?? null, version: info.version ?? null });
@@ -91,6 +138,7 @@ export class Collector {
     }
     part(part, historical = false, revision = Date.now()) {
         const message = this.messages.get(part.messageID), provider = message?.providerID ?? message?.model?.providerID, model = message?.modelID ?? message?.model?.modelID;
+        this.capturePart(part, message, revision);
         const account = this.requestAccounts.get(`${part.sessionID}:${message?.parentID ?? part.messageID}:${provider}:${model}`) ?? this.accounts.get(part.sessionID);
         const base = { provider: provider ?? null, model: model ?? null, agent: message?.agent ?? null, variant: message?.variant ?? null, ...(!historical ? account : {}) };
         if (part.type === "step-finish")

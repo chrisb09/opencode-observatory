@@ -17,6 +17,7 @@ const plugin:Plugin=async ctx=>{
   if(!version){version=detectVersion();versionSource=version?"executable":"unknown";}
   let runtime=await inventory([],ctx.directory,version);runtime.opencodeSource=versionSource;
   let collector:Collector|null=config?new Collector(config,runtime,event=>outbox?.enqueue(event),ctx.project.id):null;
+  if(collector&&config&&config.contentMode!=="off")collector.contentSink=part=>outbox?.enqueueContent(part);
   if(outbox)outbox.start();
   if(config)void syncLocalAccounts(config,registry.original);
   let importTask:Promise<unknown>|undefined;
@@ -25,9 +26,14 @@ const plugin:Plugin=async ctx=>{
   const startTelemetry=(newConfig:NonNullable<typeof config>)=>{
     config=newConfig;
     void syncLocalAccounts(config,registry.original);
+    if(collector&&outbox){
+      collector.config=newConfig;
+      collector.contentSink=newConfig.contentMode!=="off"?part=>outbox?.enqueueContent(part):undefined;
+    }
     if(!outbox){
       outbox=new Outbox(config,undefined,registry.original);
       collector=new Collector(config,runtime,event=>outbox?.enqueue(event),ctx.project.id);
+      if(config.contentMode!=="off")collector.contentSink=part=>outbox?.enqueueContent(part);
       outbox.start();
       if(config.autoImport&&!importTask){
         importTask=importHistory(collector,outbox).catch(()=>log("Historical import failed."));
@@ -42,6 +48,7 @@ const plugin:Plugin=async ctx=>{
         apiKey:tool.schema.string().optional().describe("Observatory telemetry API key (starts with 'obs_') created in Observatory Settings"),
         url:tool.schema.string().optional().describe("Observatory server URL (defaults to http://localhost:7692)"),
         autoImport:tool.schema.boolean().optional().describe("Whether to import past sessions automatically (default: true)"),
+        contentMode:tool.schema.enum(["off","text","full"]).optional().describe("Transcript capture: off (metadata only), text (prompts, responses, reasoning, media descriptors), or full (also capped tool input/output)"),
         clear:tool.schema.boolean().optional().describe("Set to true to disconnect Observatory and delete the local configuration"),
         clearData:tool.schema.boolean().optional().describe("When clear is true, also delete the local SQLite outbox database"),
       },
@@ -56,7 +63,7 @@ const plugin:Plugin=async ctx=>{
           if(!args.apiKey){
             return "Please provide your Observatory telemetry API key (starts with 'obs_') to connect, or pass clear: true to remove the current configuration.";
           }
-          const result=await configureObservatory({url:args.url,apiKey:args.apiKey,autoImport:args.autoImport,fetcher:registry.original});
+          const result=await configureObservatory({url:args.url,apiKey:args.apiKey,autoImport:args.autoImport,contentMode:args.contentMode,fetcher:registry.original});
           startTelemetry(result.config);
           return result.message;
         }catch(error){
@@ -121,7 +128,7 @@ const plugin:Plugin=async ctx=>{
     tool:tools,
     dispose:async()=>{
       if(importTask)await importTask;
-      if(outbox){try{await outbox.flush();}catch{}await outbox.close();}
+      if(outbox){try{await outbox.flush();}catch{}try{await outbox.flushContent();}catch{}await outbox.close();}
       uninstallTransport(registry,collector);
     },
   };

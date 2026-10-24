@@ -8,6 +8,13 @@ export function collectSession(collector, info, historical = false) {
     }, historical);
 }
 export function collectMessage(collector, sessionID, message, revision = message.time?.completed ?? message.time?.streamed ?? message.time?.created) {
+    if (message.type === "user") {
+        const observedAt = message.time?.created ?? revision;
+        collector.content({ sessionId: sessionID, messageId: message.id, partId: `${message.id}:prompt`, kind: "prompt", role: "user", text: String(message.text ?? ""), observedAt });
+        for (const file of message.files ?? [])
+            collector.contentAttachment(sessionID, message.id, file, observedAt, "user");
+        return;
+    }
     if (message.type !== "assistant" && message.type !== "compaction")
         return;
     collector.message({
@@ -18,6 +25,9 @@ export function collectMessage(collector, sessionID, message, revision = message
         modelID: message.model?.id,
         time: { ...message.time, completed: message.time?.completed ?? (message.type === "compaction" && message.status !== "running" ? revision : undefined) },
     }, true, revision);
+    if (message.type === "compaction") {
+        collector.content({ sessionId: sessionID, messageId: message.id, partId: `${message.id}:summary`, kind: "response", role: "assistant", text: String(message.summary ?? message.recent ?? ""), observedAt: message.time?.created ?? revision });
+    }
     // Do not manufacture step records from snapshots: existing V1 or live V2 steps
     // already account for the message. The server falls back to message usage when
     // no step exists, so backfill and live capture never count the same call twice.

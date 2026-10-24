@@ -4081,6 +4081,7 @@ var ConfigSchema = external_exports.object({
   machine: external_exports.string().min(1).max(256),
   autoImport: external_exports.boolean().default(false),
   enableTools: external_exports.boolean().default(true),
+  contentMode: external_exports.enum(["off", "text", "full"]).default("off"),
   accounts: external_exports.record(external_exports.string()).default({}),
   historyDatabase: external_exports.string().optional()
 }).strict();
@@ -4149,7 +4150,9 @@ async function configureObservatory(options) {
     machine: identity.machine,
     accounts: existing?.accounts ?? {},
     autoImport: options.autoImport ?? existing?.autoImport ?? true,
-    enableTools
+    enableTools,
+    contentMode: options.contentMode ?? existing?.contentMode ?? "off",
+    ...existing?.historyDatabase ? { historyDatabase: existing.historyDatabase } : {}
   };
   await saveConfig(config);
   const message = [
@@ -4159,7 +4162,8 @@ async function configureObservatory(options) {
     `\u2022 Machine: ${config.machine}`,
     `\u2022 Ingestion: Active`,
     `\u2022 Query tools: ${enableTools ? "Enabled" : "Disabled (requires API key with read scope)"}`,
-    `\u2022 Past sessions auto-import: ${config.autoImport ? "Enabled" : "Disabled"}`
+    `\u2022 Past sessions auto-import: ${config.autoImport ? "Enabled" : "Disabled"}`,
+    `\u2022 Transcript capture: ${config.contentMode === "off" ? "Disabled (metadata only)" : config.contentMode === "text" ? "Text only (no tool I/O)" : "Full (capped tool I/O)"}`
   ].join("\n");
   return { config, hasReadScope, message };
 }
@@ -4170,73 +4174,169 @@ import { mkdirSync, chmodSync } from "node:fs";
 import { dirname, join as join2 } from "node:path";
 import { createHash } from "node:crypto";
 
-// ../contracts/dist/index.js
-var count = external_exports.number().int().nonnegative().nullable();
-var timestamp = external_exports.number().int().nonnegative();
+// ../contracts/dist/memory.js
 var id = external_exports.string().min(1).max(256);
 var short = external_exports.string().max(512);
+var timestamp = external_exports.number().int().nonnegative();
+var count = external_exports.number().int().nonnegative();
+var ContentHashSchema = external_exports.string().regex(/^sha256:[0-9a-f]{64}$/);
+var MediaSchema = external_exports.object({
+  contentHash: ContentHashSchema,
+  mime: short,
+  bytes: count.nullable(),
+  width: count.nullable().optional(),
+  height: count.nullable().optional(),
+  filename: short.nullable().optional(),
+  availability: external_exports.enum(["inline", "local", "remote", "tool", "local_missing"]),
+  visualKind: external_exports.enum(["ui_screenshot", "terminal", "chart", "diagram", "document", "photo", "other"]).nullable().optional(),
+  description: external_exports.string().max(4e3).nullable().optional(),
+  extractedText: external_exports.string().max(2e4).nullable().optional(),
+  descriptorSource: external_exports.enum(["vision", "context_inferred", "none"]).optional(),
+  generatorModel: short.nullable().optional()
+}).strict();
+var ContentPartSchema = external_exports.object({
+  installationId: external_exports.string().uuid(),
+  sessionId: id,
+  messageId: id,
+  partId: id,
+  kind: external_exports.enum(["prompt", "response", "reasoning", "tool_input", "tool_output", "media"]),
+  role: external_exports.enum(["user", "assistant", "tool", "system"]).nullable(),
+  text: external_exports.string().max(1e6),
+  /** sha256 of the scrubbed text, or of the descriptor for media parts. */
+  contentHash: ContentHashSchema,
+  truncated: external_exports.boolean().default(false),
+  originalBytes: count.nullable().default(null),
+  observedAt: timestamp,
+  media: MediaSchema.nullable().optional()
+}).strict();
+var ContentBatchSchema = external_exports.object({ parts: external_exports.array(ContentPartSchema).min(1).max(20) }).strict();
+var SummarySchema = external_exports.object({
+  installationId: external_exports.string().uuid(),
+  sessionId: id,
+  targetKind: external_exports.enum(["part", "message", "turn", "session"]),
+  targetId: id,
+  summaryShort: external_exports.string().min(1).max(2e3),
+  summaryDetailed: external_exports.string().max(2e4),
+  keyDecisions: external_exports.array(external_exports.string().max(500)).max(50).default([]),
+  filesTouched: external_exports.array(external_exports.string().max(512)).max(200).default([]),
+  concepts: external_exports.array(external_exports.string().max(200)).max(50).default([]),
+  generatorModel: short,
+  promptVersion: short,
+  sourceHash: ContentHashSchema
+}).strict();
+var EvidenceRefSchema = external_exports.object({
+  installationId: external_exports.string().uuid(),
+  sessionId: id,
+  messageId: id.nullable().optional(),
+  partId: id.nullable().optional(),
+  tool: short.nullable().optional(),
+  url: external_exports.string().max(2048).nullable().optional(),
+  observedAt: timestamp
+}).strict();
+var ClaimCandidateSchema = external_exports.object({
+  concept: external_exports.string().regex(/^[a-z0-9][a-z0-9._/-]{0,199}$/),
+  subject: external_exports.string().regex(/^[a-z0-9][a-z0-9._-]{0,199}$/),
+  statement: external_exports.string().min(8).max(4e3),
+  polarity: external_exports.enum(["affirm", "deny"]),
+  modality: external_exports.enum(["fact", "decision", "hypothesis"]),
+  scope: external_exports.enum(["global", "project", "machine"]),
+  scopeValue: short.nullable().default(null),
+  evidenceTier: external_exports.enum(["tool_verified", "user_stated", "external_reference", "assistant_assertion"]),
+  singleValued: external_exports.boolean().default(true),
+  evidence: external_exports.array(EvidenceRefSchema).min(1).max(32),
+  contradicts: external_exports.array(id).max(16).default([])
+}).strict().superRefine((value, context) => {
+  if (value.scope !== "global" && !value.scopeValue) {
+    context.addIssue({ code: external_exports.ZodIssueCode.custom, path: ["scopeValue"], message: "scopeValue is required for project and machine scopes" });
+  }
+  if (value.scope === "global" && value.scopeValue !== null) {
+    context.addIssue({ code: external_exports.ZodIssueCode.custom, path: ["scopeValue"], message: "scopeValue must be null for global scope" });
+  }
+});
+var ClaimBatchSchema = external_exports.object({ claims: external_exports.array(ClaimCandidateSchema).min(1).max(64) }).strict();
+var VaultApplySchema = external_exports.object({
+  claims: external_exports.array(ClaimCandidateSchema).min(1).max(64),
+  source: external_exports.object({
+    installationId: external_exports.string().uuid().optional(),
+    machine: short.optional(),
+    rootSessionId: id.optional(),
+    evidenceSessionId: id.optional(),
+    messageIds: external_exports.array(id).max(64).optional(),
+    agent: short.optional(),
+    model: short.optional(),
+    promptVersion: short.optional(),
+    evidenceTier: external_exports.enum(["tool_verified", "user_stated", "external_reference", "assistant_assertion"]).optional()
+  }).strict().optional(),
+  message: external_exports.string().max(200).optional()
+}).strict();
+
+// ../contracts/dist/index.js
+var count2 = external_exports.number().int().nonnegative().nullable();
+var timestamp2 = external_exports.number().int().nonnegative();
+var id2 = external_exports.string().min(1).max(256);
+var short2 = external_exports.string().max(512);
 var RuntimeSchema = external_exports.object({
-  opencode: short.nullable(),
+  opencode: short2.nullable(),
   opencodeSource: external_exports.enum(["server-health", "executable", "unknown"]).optional(),
-  collector: short,
-  plugins: external_exports.array(external_exports.object({ spec: short, name: short, version: short.nullable(), hash: short.optional(), source: external_exports.enum(["resolved", "declared", "unknown"]) }).strict()).max(100),
-  capturedAt: timestamp,
+  collector: short2,
+  plugins: external_exports.array(external_exports.object({ spec: short2, name: short2, version: short2.nullable(), hash: short2.optional(), source: external_exports.enum(["resolved", "declared", "unknown"]) }).strict()).max(100),
+  capturedAt: timestamp2,
   provenance: external_exports.enum(["capture", "import-current", "historical"])
 }).strict();
 var MetadataSchema = external_exports.object({
-  provider: short.nullable().optional(),
-  model: short.nullable().optional(),
-  responseModel: short.nullable().optional(),
-  account: short.nullable().optional(),
-  credential: short.nullable().optional(),
-  authType: short.nullable().optional(),
-  parentSessionId: id.nullable().optional(),
-  parentMessageId: id.nullable().optional(),
-  agent: short.nullable().optional(),
-  variant: short.nullable().optional(),
+  provider: short2.nullable().optional(),
+  model: short2.nullable().optional(),
+  responseModel: short2.nullable().optional(),
+  account: short2.nullable().optional(),
+  credential: short2.nullable().optional(),
+  authType: short2.nullable().optional(),
+  parentSessionId: id2.nullable().optional(),
+  parentMessageId: id2.nullable().optional(),
+  agent: short2.nullable().optional(),
+  variant: short2.nullable().optional(),
   status: external_exports.enum(["running", "completed", "failed", "cancelled", "unknown"]).optional(),
-  startedAt: timestamp.optional(),
-  endedAt: timestamp.nullable().optional(),
+  startedAt: timestamp2.optional(),
+  endedAt: timestamp2.nullable().optional(),
   durationMs: external_exports.number().nonnegative().nullable().optional(),
   headerMs: external_exports.number().nonnegative().nullable().optional(),
   firstOutputMs: external_exports.number().nonnegative().nullable().optional(),
-  inputTokens: count.optional(),
-  outputTokens: count.optional(),
-  reasoningTokens: count.optional(),
-  cacheReadTokens: count.optional(),
-  cacheWriteTokens: count.optional(),
-  totalTokens: count.optional(),
+  inputTokens: count2.optional(),
+  outputTokens: count2.optional(),
+  reasoningTokens: count2.optional(),
+  cacheReadTokens: count2.optional(),
+  cacheWriteTokens: count2.optional(),
+  totalTokens: count2.optional(),
   usageSource: external_exports.enum(["opencode", "provider", "unavailable"]).optional(),
   usageSemantics: external_exports.enum(["opencode-exclusive-input", "provider-inclusive-input", "unknown"]).optional(),
   outputSemantics: external_exports.enum(["exclusive-reasoning", "inclusive-reasoning", "unknown"]).optional(),
   accountSource: external_exports.enum(["observed", "configured", "assigned", "unassigned"]).optional(),
   cost: external_exports.number().nonnegative().nullable().optional(),
   costSource: external_exports.enum(["opencode-estimate", "provider", "unavailable", "override-estimate"]).optional(),
-  contextLimit: count.optional(),
-  outputLimit: count.optional(),
-  requestBytes: count.optional(),
-  responseBytes: count.optional(),
-  textBytes: count.optional(),
-  reasoningBytes: count.optional(),
-  argumentBytes: count.optional(),
-  outputBytes: count.optional(),
+  contextLimit: count2.optional(),
+  outputLimit: count2.optional(),
+  requestBytes: count2.optional(),
+  responseBytes: count2.optional(),
+  textBytes: count2.optional(),
+  reasoningBytes: count2.optional(),
+  argumentBytes: count2.optional(),
+  outputBytes: count2.optional(),
   title: external_exports.string().max(512).nullable().optional(),
   marketCost: external_exports.number().nonnegative().nullable().optional(),
-  tool: short.optional(),
-  callId: id.optional(),
-  finishReason: short.nullable().optional(),
+  tool: short2.optional(),
+  callId: id2.optional(),
+  finishReason: short2.nullable().optional(),
   httpStatus: external_exports.number().int().min(100).max(599).nullable().optional(),
   retryable: external_exports.boolean().nullable().optional(),
-  errorType: short.nullable().optional(),
-  errorCode: short.nullable().optional(),
+  errorType: short2.nullable().optional(),
+  errorCode: short2.nullable().optional(),
   errorMessage: external_exports.string().max(1024).nullable().optional(),
-  mime: short.optional(),
-  bytes: count.optional(),
-  width: count.optional(),
-  height: count.optional(),
+  mime: short2.optional(),
+  bytes: count2.optional(),
+  width: count2.optional(),
+  height: count2.optional(),
   attachmentSource: external_exports.enum(["inline", "local", "remote", "tool"]).optional(),
-  requestId: short.nullable().optional(),
-  sessionVersion: short.nullable().optional(),
+  requestId: short2.nullable().optional(),
+  sessionVersion: short2.nullable().optional(),
   purpose: external_exports.enum(["chat", "compaction", "auxiliary", "unknown"]).optional(),
   coverage: external_exports.enum(["lifecycle", "transport", "historical"]).optional()
 }).strict();
@@ -4246,13 +4346,13 @@ var EventSchema = external_exports.object({
   installationId: external_exports.string().uuid(),
   instanceId: external_exports.string().uuid(),
   machine: external_exports.string().min(1).max(256),
-  projectId: id.nullable(),
-  sessionId: id.nullable(),
-  messageId: id.nullable(),
+  projectId: id2.nullable(),
+  sessionId: id2.nullable(),
+  messageId: id2.nullable(),
   kind: external_exports.enum(["session", "message", "step", "attempt", "tool", "attachment", "text", "error"]),
-  entityId: id,
-  observedAt: timestamp,
-  revision: timestamp,
+  entityId: id2,
+  observedAt: timestamp2,
+  revision: timestamp2,
   historical: external_exports.boolean(),
   runtime: RuntimeSchema,
   data: MetadataSchema
@@ -4261,15 +4361,15 @@ var BatchSchema = external_exports.object({ events: external_exports.array(Event
 var FilterSchema = external_exports.object({
   from: external_exports.coerce.number().int().nonnegative().optional(),
   to: external_exports.coerce.number().int().nonnegative().optional(),
-  provider: short.optional(),
-  model: short.optional(),
-  account: short.optional(),
-  credential: short.optional(),
-  machine: short.optional(),
-  sessionId: id.optional(),
+  provider: short2.optional(),
+  model: short2.optional(),
+  account: short2.optional(),
+  credential: short2.optional(),
+  machine: short2.optional(),
+  sessionId: id2.optional(),
   installationId: external_exports.string().uuid().optional(),
-  projectId: id.optional(),
-  status: short.optional(),
+  projectId: id2.optional(),
+  status: short2.optional(),
   groupBy: external_exports.enum(["model", "provider", "account", "machine", "agent", "credential"]).default("model"),
   sortBy: external_exports.enum(["observed_at", "entity_id", "model", "provider", "machine", "status", "agent", "inputTokens", "outputTokens", "reasoningTokens", "cacheReadTokens", "totalTokens", "cost", "marketCost", "durationMs", "tool", "mime", "bytes", "argumentBytes", "outputBytes", "coverage", "error_type", "error_code", "http_status", "occurrences", "sessions", "retryable", "last_seen"]).default("observed_at"),
   sortDir: external_exports.enum(["asc", "desc"]).default("desc"),
@@ -4290,11 +4390,14 @@ var Outbox = class {
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS outbox(event_id TEXT PRIMARY KEY, digest TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,acknowledged_at INTEGER);
       CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(acknowledged_at,created_at);
+      CREATE TABLE IF NOT EXISTS content(id TEXT PRIMARY KEY,digest TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,acknowledged_at INTEGER);
+      CREATE INDEX IF NOT EXISTS content_pending ON content(acknowledged_at,created_at);
       CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY,updated_at INTEGER NOT NULL,session_id TEXT NOT NULL);
     `);
   }
   db;
   inflight = null;
+  contentInflight = null;
   timer;
   backoff = 1e3;
   stopped = false;
@@ -4304,8 +4407,16 @@ var Outbox = class {
     const digest = createHash("sha256").update(JSON.stringify({ installation: event.installationId, kind: event.kind, id: event.entityId, revision: event.revision, data: event.data, historical: event.historical, ...!event.historical ? { runtime: event.runtime } : {} })).digest("hex");
     this.db.query("INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,NULL)").run(event.eventId, digest, JSON.stringify(event), Date.now());
   }
+  enqueueContent(value) {
+    const part = ContentPartSchema.parse(value);
+    const id3 = [part.installationId, part.sessionId, part.messageId, part.partId, part.kind].join("\0");
+    const digest = createHash("sha256").update(JSON.stringify(part)).digest("hex");
+    this.db.query(`INSERT INTO content(id,digest,payload,created_at,acknowledged_at) VALUES(?,?,?,?,NULL)
+      ON CONFLICT(id) DO UPDATE SET digest=excluded.digest,payload=excluded.payload,created_at=excluded.created_at,acknowledged_at=NULL
+      WHERE excluded.digest<>content.digest`).run(id3, digest, JSON.stringify(part), Date.now());
+  }
   health() {
-    return { pending: this.db.query("SELECT count(*) AS n FROM outbox WHERE acknowledged_at IS NULL").get().n, acknowledged: this.db.query("SELECT count(*) AS n FROM outbox WHERE acknowledged_at IS NOT NULL").get().n, lastError: this.lastError };
+    return { pending: this.db.query("SELECT count(*) AS n FROM outbox WHERE acknowledged_at IS NULL").get().n, pendingContent: this.db.query("SELECT count(*) AS n FROM content WHERE acknowledged_at IS NULL").get().n, acknowledged: this.db.query("SELECT count(*) AS n FROM outbox WHERE acknowledged_at IS NOT NULL").get().n, acknowledgedContent: this.db.query("SELECT count(*) AS n FROM content WHERE acknowledged_at IS NOT NULL").get().n, lastError: this.lastError };
   }
   flush() {
     if (this.inflight) return this.inflight;
@@ -4314,6 +4425,13 @@ var Outbox = class {
     });
     return this.inflight;
   }
+  flushContent() {
+    if (this.contentInflight) return this.contentInflight;
+    this.contentInflight = this.sendContent().finally(() => {
+      this.contentInflight = null;
+    });
+    return this.contentInflight;
+  }
   async send() {
     try {
       const rows = this.db.query("SELECT event_id,payload FROM outbox WHERE acknowledged_at IS NULL ORDER BY created_at,event_id LIMIT 100").all();
@@ -4321,19 +4439,46 @@ var Outbox = class {
       const result = await api(this.config, "/api/ingest", { events: rows.map((r) => JSON.parse(r.payload)) }, this.fetcher);
       if (!Array.isArray(result.acknowledged) || !result.acknowledged.every((v) => typeof v === "string")) throw new Error("Invalid server acknowledgement");
       const expected = new Set(rows.map((r) => r.event_id));
-      let count2 = 0;
+      let count3 = 0;
       this.db.transaction(() => {
-        for (const id2 of result.acknowledged) if (expected.has(id2)) {
-          this.db.query("UPDATE outbox SET acknowledged_at=? WHERE event_id=? AND acknowledged_at IS NULL").run(Date.now(), id2);
-          count2++;
+        for (const id3 of result.acknowledged) if (expected.has(id3)) {
+          this.db.query("UPDATE outbox SET acknowledged_at=? WHERE event_id=? AND acknowledged_at IS NULL").run(Date.now(), id3);
+          count3++;
         }
       })();
-      if (!count2) throw new Error("Server acknowledged no queued events");
+      if (!count3) throw new Error("Server acknowledged no queued events");
       this.lastError = null;
       this.backoff = 1e3;
-      return count2;
+      return count3;
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : "Upload failed";
+      this.backoff = Math.min(this.backoff * 2, 6e4);
+      throw error;
+    }
+  }
+  async sendContent() {
+    try {
+      const candidates = this.db.query("SELECT id,payload FROM content WHERE acknowledged_at IS NULL ORDER BY created_at,id LIMIT 20").all();
+      const rows = [];
+      let bytes = 0;
+      for (const row of candidates) {
+        const size2 = Buffer.byteLength(row.payload, "utf8");
+        if (rows.length && bytes + size2 > 6 * 1024 * 1024) break;
+        rows.push(row);
+        bytes += size2;
+      }
+      if (!rows.length) return 0;
+      const result = await api(this.config, "/api/content", { parts: rows.map((r) => JSON.parse(r.payload)) }, this.fetcher);
+      if (typeof result.accepted !== "number" || result.accepted !== rows.length) throw new Error("Invalid content acknowledgement");
+      const now = Date.now();
+      this.db.transaction(() => {
+        for (const row of rows) this.db.query("UPDATE content SET acknowledged_at=? WHERE id=? AND acknowledged_at IS NULL").run(now, row.id);
+      })();
+      this.lastError = null;
+      this.backoff = 1e3;
+      return rows.length;
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : "Content upload failed";
       this.backoff = Math.min(this.backoff * 2, 6e4);
       throw error;
     }
@@ -4346,22 +4491,32 @@ var Outbox = class {
         await this.flush();
       } catch {
       }
+      try {
+        await this.flushContent();
+      } catch {
+      }
       if (this.stopped) return;
-      this.timer = setTimeout(tick, this.lastError ? this.backoff + Math.random() * 1e3 : this.health().pending ? 250 : 5e3);
+      const health = this.health();
+      this.timer = setTimeout(tick, this.lastError ? this.backoff + Math.random() * 1e3 : health.pending || health.pendingContent ? 250 : 5e3);
       this.timer.unref?.();
     };
     this.timer = setTimeout(tick, 500);
     this.timer.unref?.();
   }
   async drain() {
-    while (this.health().pending) {
-      const count2 = await this.flush();
-      if (!count2) break;
+    while (true) {
+      const health = this.health();
+      if (!health.pending && !health.pendingContent) break;
+      let moved = 0;
+      if (health.pending) moved += await this.flush();
+      if (health.pendingContent) moved += await this.flushContent();
+      if (!moved) break;
     }
     return this.health();
   }
   replay() {
     this.db.query("UPDATE outbox SET acknowledged_at=NULL").run();
+    this.db.query("UPDATE content SET acknowledged_at=NULL").run();
   }
   cursor(source) {
     return this.db.query("SELECT updated_at,session_id FROM cursors WHERE source=?").get(source);
@@ -4382,8 +4537,210 @@ var Outbox = class {
 
 // src/metadata.ts
 import { createHmac, randomUUID as randomUUID2 } from "node:crypto";
-import { statSync } from "node:fs";
+import { statSync as statSync2 } from "node:fs";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// src/content.ts
+import { createHash as createHash2 } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
+
+// src/scrub.ts
+var RULES = [
+  { pattern: /\b(Bearer)\s+[A-Za-z0-9._~+/=-]{12,}/g, replacement: "$1 [REDACTED]" },
+  { pattern: /\b(Basic)\s+[A-Za-z0-9+/=]{12,}/g, replacement: "$1 [REDACTED]" },
+  { pattern: /\bsk-[A-Za-z0-9_-]{16,}\b/g, replacement: "sk-[REDACTED]" },
+  { pattern: /\bxai-[A-Za-z0-9]{20,}\b/g, replacement: "xai-[REDACTED]" },
+  { pattern: /\bobs_[A-Za-z0-9_-]{16,}\b/g, replacement: "obs_[REDACTED]" },
+  { pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, replacement: "gh*_[REDACTED]" },
+  { pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, replacement: "github_pat_[REDACTED]" },
+  { pattern: /\bglpat-[A-Za-z0-9_-]{20,}\b/g, replacement: "glpat-[REDACTED]" },
+  { pattern: /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g, replacement: "xox*_[REDACTED]" },
+  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: "AKIA[REDACTED]" },
+  { pattern: /\bAIza[0-9A-Za-z_-]{30,}\b/g, replacement: "AIza[REDACTED]" },
+  { pattern: /\bhf_[A-Za-z0-9]{20,}\b/g, replacement: "hf_[REDACTED]" },
+  { pattern: /\bnpm_[A-Za-z0-9]{20,}\b/g, replacement: "npm_[REDACTED]" },
+  { pattern: /\bpypi-[A-Za-z0-9_-]{20,}\b/g, replacement: "pypi-[REDACTED]" },
+  {
+    pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+    replacement: "[REDACTED PRIVATE KEY]"
+  },
+  {
+    // KEY=value, TOKEN: value, PASSWORD=... in .env files and shell exports.
+    pattern: /(^|\n)([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|AUTH)[A-Za-z0-9_]*)\s*[:=]\s*["']?([^\s"'#]{8,})["']?/gi,
+    replacement: (_match, prefix, name) => `${prefix}${name}=[REDACTED]`
+  },
+  {
+    pattern: /("(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|credential)"\s*:\s*")[^"]{8,}(")/gi,
+    replacement: "$1[REDACTED]$2"
+  },
+  {
+    pattern: /([?&](?:token|key|api_key|apikey|access_token|secret|password)=)[^&\s]{8,}/gi,
+    replacement: "$1[REDACTED]"
+  }
+];
+function redactSecrets(input) {
+  let text = input;
+  let redactions = 0;
+  for (const rule of RULES) {
+    if (typeof rule.replacement === "string") {
+      const before = text;
+      text = text.replace(rule.pattern, rule.replacement);
+      if (text !== before) redactions += 1;
+    } else {
+      text = text.replace(rule.pattern, (...args) => {
+        redactions += 1;
+        return rule.replacement(...args);
+      });
+    }
+  }
+  return { text, redactions };
+}
+
+// src/content.ts
+var TOOL_OUTPUT_LIMIT = 8192;
+var MAX_LOCAL_MEDIA_BYTES = 32 * 1024 * 1024;
+function hashText(text) {
+  return `sha256:${createHash2("sha256").update(text, "utf8").digest("hex")}`;
+}
+function hashBytes(bytes) {
+  return `sha256:${createHash2("sha256").update(bytes).digest("hex")}`;
+}
+function truncateText(value, limit = TOOL_OUTPUT_LIMIT) {
+  const originalBytes = Buffer.byteLength(value, "utf8");
+  if (originalBytes <= limit) return { text: value, truncated: false, originalBytes };
+  const half = Math.floor(limit / 2);
+  const head = value.slice(0, half);
+  const tail = value.slice(-half);
+  return {
+    text: `${head}
+\u2026[truncated ${originalBytes - Buffer.byteLength(head + tail, "utf8")} bytes]\u2026
+${tail}`,
+    truncated: true,
+    originalBytes
+  };
+}
+function dimensions(bytes) {
+  if (bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+  }
+  if (bytes.length >= 10 && bytes.subarray(0, 3).toString("ascii") === "GIF") {
+    return { width: bytes.readUInt16LE(6), height: bytes.readUInt16LE(8) };
+  }
+  if (bytes.length >= 30 && bytes.subarray(12, 16).toString("ascii") === "WEBP") {
+    if (bytes.subarray(16, 20).toString("ascii") === "VP8X") {
+      const width = 1 + (bytes[24] | bytes[25] << 8 | bytes[26] << 16);
+      const height = 1 + (bytes[27] | bytes[28] << 8 | bytes[29] << 16);
+      return { width, height };
+    }
+  }
+  if (bytes.length >= 4 && bytes[0] === 255 && bytes[1] === 216) {
+    let offset = 2;
+    while (offset + 9 < bytes.length) {
+      if (bytes[offset] !== 255) {
+        offset += 1;
+        continue;
+      }
+      const marker = bytes[offset + 1];
+      if (marker === 216 || marker === 217) {
+        offset += 2;
+        continue;
+      }
+      const length = bytes.readUInt16BE(offset + 2);
+      if (marker >= 192 && marker <= 207 && marker !== 196 && marker !== 200 && marker !== 204) {
+        return { height: bytes.readUInt16BE(offset + 5), width: bytes.readUInt16BE(offset + 7) };
+      }
+      offset += 2 + length;
+    }
+  }
+  return null;
+}
+function mediaOf(contentHash, mime, bytes, filename, availability, imageBytes) {
+  const size2 = imageBytes ? dimensions(imageBytes) : null;
+  return {
+    contentHash,
+    mime,
+    bytes,
+    width: size2?.width ?? null,
+    height: size2?.height ?? null,
+    filename,
+    availability
+  };
+}
+function mediaFromUrl(url, options = {}) {
+  const hintedMime = options.mime;
+  const mime = hintedMime ?? "application/octet-stream";
+  const filename = options.filename ?? null;
+  if (url.startsWith("data:")) {
+    const match = /^data:([^;,]*)(;base64)?,([\s\S]*)$/.exec(url);
+    if (!match) return null;
+    try {
+      const bytes = match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3]), "utf8");
+      const declared = match[1] || "application/octet-stream";
+      return mediaOf(hashBytes(bytes), hintedMime ?? declared, bytes.length, filename, "inline", bytes);
+    } catch {
+      return null;
+    }
+  }
+  if (url.startsWith("file:")) {
+    try {
+      const path = fileURLToPath(url);
+      const stat2 = statSync(path);
+      if (stat2.size <= MAX_LOCAL_MEDIA_BYTES) {
+        const bytes = readFileSync(path);
+        return mediaOf(hashBytes(bytes), mime, stat2.size, filename ?? basename(path), "local", bytes);
+      }
+      return mediaOf(hashText(url), mime, stat2.size, filename ?? basename(path), "local");
+    } catch {
+      return mediaOf(hashText(url), mime, null, filename, "local_missing");
+    }
+  }
+  if (/^https?:\/\//i.test(url)) {
+    return mediaOf(hashText(url), mime, null, filename, options.source === "tool" ? "tool" : "remote");
+  }
+  return null;
+}
+function mediaFromPart(part) {
+  const url = part?.url ?? part?.uri;
+  if (typeof url !== "string" || !url) return null;
+  return mediaFromUrl(url, {
+    mime: typeof part.mime === "string" ? part.mime : void 0,
+    filename: typeof part.filename === "string" ? part.filename : typeof part.name === "string" ? part.name : null,
+    ...part?.attachments || part?.tool ? { source: "tool" } : {}
+  });
+}
+function mediaMarker(media) {
+  const size2 = media.bytes === null || media.bytes === void 0 ? "size unknown" : `${media.bytes} bytes`;
+  return `[media ${media.mime}${media.filename ? ` ${media.filename}` : ""} \xB7 ${size2} \xB7 ${media.contentHash}]`;
+}
+function makeContentPart(input) {
+  const original = input.text ?? "";
+  const redacted = redactSecrets(original);
+  const tool = input.kind === "tool_input" || input.kind === "tool_output";
+  const capped = truncateText(redacted.text, tool ? TOOL_OUTPUT_LIMIT : 1e6);
+  const media = input.media ? {
+    ...input.media,
+    description: input.media.description ? redactSecrets(input.media.description).text : input.media.description,
+    extractedText: input.media.extractedText ? redactSecrets(input.media.extractedText).text : input.media.extractedText
+  } : null;
+  return {
+    installationId: input.installationId,
+    sessionId: input.sessionId,
+    messageId: input.messageId,
+    partId: input.partId,
+    kind: input.kind,
+    role: input.role,
+    text: capped.text,
+    contentHash: hashText(capped.text),
+    truncated: capped.truncated,
+    originalBytes: capped.originalBytes,
+    observedAt: input.observedAt,
+    ...media ? { media } : {}
+  };
+}
+
+// src/metadata.ts
 var size = (value) => Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value) ?? "");
 var num = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
 function safeError(error) {
@@ -4411,6 +4768,7 @@ var Collector = class {
   sessions = /* @__PURE__ */ new Map();
   accounts = /* @__PURE__ */ new Map();
   requestAccounts = /* @__PURE__ */ new Map();
+  contentSink;
   record(kind, entityId, data, sessionId = null, messageId = null, historical = false, revision = Date.now(), observedAt = data.startedAt ?? revision) {
     const session = sessionId ? this.sessions.get(sessionId) : void 0;
     this.emit({
@@ -4430,6 +4788,41 @@ var Collector = class {
       runtime: historical ? { ...this.runtime, opencode: null, provenance: "import-current" } : this.runtime,
       data: { coverage: historical ? "historical" : "lifecycle", ...data }
     });
+  }
+  content(input) {
+    if (!this.contentSink || this.config.contentMode === "off") return;
+    this.contentSink(makeContentPart({ installationId: this.config.installationId, ...input }));
+  }
+  contentAttachment(sessionId, messageId, part, observedAt, role = "tool") {
+    if (!this.contentSink || this.config.contentMode === "off") return;
+    const media = mediaFromPart(part);
+    if (!media) return;
+    const partId = String(part?.id ?? `${messageId}:media:${media.contentHash.slice(7, 19)}`);
+    this.content({ sessionId, messageId, partId, kind: "media", role, text: mediaMarker(media), observedAt, media });
+  }
+  capturePart(part, message, revision) {
+    if (!this.contentSink || this.config.contentMode === "off") return;
+    const sessionId = part.sessionID ?? message?.sessionID ?? null, messageId = part.messageID ?? message?.id ?? null;
+    if (!sessionId || !messageId) return;
+    const role = message?.role === "user" ? "user" : "assistant";
+    const partId = String(part.id ?? `${messageId}:${part.type ?? "part"}`);
+    const observedAt = part.time?.start ?? part.time?.created ?? message?.time?.created ?? revision;
+    if (part.type === "text") {
+      if (part.synthetic || part.ignored) return;
+      this.content({ sessionId, messageId, partId, kind: role === "user" ? "prompt" : "response", role, text: String(part.text ?? ""), observedAt });
+    } else if (part.type === "reasoning") {
+      this.content({ sessionId, messageId, partId, kind: "reasoning", role: "assistant", text: String(part.text ?? ""), observedAt });
+    } else if (part.type === "tool") {
+      if (this.config.contentMode === "full") {
+        const input = part.state?.input;
+        this.content({ sessionId, messageId, partId: `${partId}:input`, kind: "tool_input", role: "assistant", text: typeof input === "string" ? input : JSON.stringify(input ?? {}), observedAt });
+        const output = part.state?.output ?? part.state?.content;
+        this.content({ sessionId, messageId, partId: `${partId}:output`, kind: "tool_output", role: "tool", text: typeof output === "string" ? output : JSON.stringify(output ?? ""), observedAt });
+      }
+      for (const attachment of part.state?.attachments ?? []) this.contentAttachment(sessionId, messageId, attachment, observedAt);
+    } else if (part.type === "file") {
+      this.contentAttachment(sessionId, messageId, part, observedAt, role);
+    }
   }
   session(info, historical = false, revision = info.time?.updated ?? info.time_updated ?? Date.now()) {
     this.sessions.set(info.id, { projectId: info.projectID ?? info.project_id ?? null, version: info.version ?? null });
@@ -4491,6 +4884,7 @@ var Collector = class {
   }
   part(part, historical = false, revision = Date.now()) {
     const message = this.messages.get(part.messageID), provider = message?.providerID ?? message?.model?.providerID, model = message?.modelID ?? message?.model?.modelID;
+    this.capturePart(part, message, revision);
     const account = this.requestAccounts.get(`${part.sessionID}:${message?.parentID ?? part.messageID}:${provider}:${model}`) ?? this.accounts.get(part.sessionID);
     const base = { provider: provider ?? null, model: model ?? null, agent: message?.agent ?? null, variant: message?.variant ?? null, ...!historical ? account : {} };
     if (part.type === "step-finish") this.record("step", part.id, { ...base, ...usage(part.tokens, part.cost), status: "completed", finishReason: part.reason ?? null, purpose: message?.summary ? "compaction" : "chat", startedAt: message?.time?.created ?? revision }, part.sessionID, part.messageID, historical, revision, message?.time?.created ?? revision);
@@ -4526,7 +4920,7 @@ var Collector = class {
       }
     } else if (url.startsWith("file:") && !historical) {
       try {
-        bytes = statSync(fileURLToPath(url)).size;
+        bytes = statSync2(fileURLToPath2(url)).size;
       } catch {
       }
     }
@@ -4537,10 +4931,10 @@ var Collector = class {
 // src/runtime.ts
 import { execFileSync } from "node:child_process";
 import { readFile as readFile2, readdir, stat } from "node:fs/promises";
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 import { dirname as dirname2, join as join3, isAbsolute } from "node:path";
 import { homedir as homedir2 } from "node:os";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 async function inventory(specs, directory, opencode) {
   specs = [...specs];
   for (const root of [join3(directory, ".opencode"), join3(process.env.XDG_CONFIG_HOME ?? join3(homedir2(), ".config"), "opencode")]) for (const sub of ["plugins", "plugin"]) {
@@ -4565,7 +4959,7 @@ async function inventory(specs, directory, opencode) {
     const roots = [directory, join3(cache, "opencode"), join3(userConfig, "opencode")];
     let candidates = [];
     if (spec.startsWith("file:")) {
-      let path = fileURLToPath2(spec);
+      let path = fileURLToPath3(spec);
       try {
         if ((await stat(path)).isFile()) path = dirname2(path);
       } catch {
@@ -4604,7 +4998,7 @@ async function inventory(specs, directory, opencode) {
     let fileHash;
     if (isAbsolute(spec) || spec.startsWith(".") || spec.startsWith("file:")) {
       try {
-        fileHash = createHash2("sha256").update(await readFile2(spec.startsWith("file:") ? fileURLToPath2(spec) : isAbsolute(spec) ? spec : join3(directory, spec))).digest("hex");
+        fileHash = createHash3("sha256").update(await readFile2(spec.startsWith("file:") ? fileURLToPath3(spec) : isAbsolute(spec) ? spec : join3(directory, spec))).digest("hex");
       } catch {
       }
     }
@@ -4636,6 +5030,12 @@ function collectSession(collector, info, historical = false) {
   }, historical);
 }
 function collectMessage(collector, sessionID, message, revision = message.time?.completed ?? message.time?.streamed ?? message.time?.created) {
+  if (message.type === "user") {
+    const observedAt = message.time?.created ?? revision;
+    collector.content({ sessionId: sessionID, messageId: message.id, partId: `${message.id}:prompt`, kind: "prompt", role: "user", text: String(message.text ?? ""), observedAt });
+    for (const file of message.files ?? []) collector.contentAttachment(sessionID, message.id, file, observedAt, "user");
+    return;
+  }
   if (message.type !== "assistant" && message.type !== "compaction") return;
   collector.message({
     ...message,
@@ -4645,6 +5045,9 @@ function collectMessage(collector, sessionID, message, revision = message.time?.
     modelID: message.model?.id,
     time: { ...message.time, completed: message.time?.completed ?? (message.type === "compaction" && message.status !== "running" ? revision : void 0) }
   }, true, revision);
+  if (message.type === "compaction") {
+    collector.content({ sessionId: sessionID, messageId: message.id, partId: `${message.id}:summary`, kind: "response", role: "assistant", text: String(message.summary ?? message.recent ?? ""), observedAt: message.time?.created ?? revision });
+  }
   for (const [ordinal, content] of (message.content ?? []).entries()) {
     const base = { sessionID, messageID: message.id, id: content.id ?? `${message.id}:${content.type}:${ordinal}` };
     if (content.type === "tool") {
@@ -4760,7 +5163,9 @@ try {
       const apiKey = process.env.OBSERVATORY_API_KEY ?? await rl.question("Observatory API key (visible input): ");
       const autoImport = (await rl.question("Automatically import past sessions on startup? [y/N]: ")).toLowerCase() === "y";
       const enableTools = (await rl.question("Enable in-OpenCode statistics tools? [Y/n]: ")).toLowerCase() !== "n";
-      const result = await configureObservatory({ url: rawUrl, apiKey, autoImport, enableTools });
+      const contentAnswer = (await rl.question("Capture transcript text? [off/text/full] (default off): ")).trim().toLowerCase();
+      const contentMode = contentAnswer === "text" || contentAnswer === "full" ? contentAnswer : "off";
+      const result = await configureObservatory({ url: rawUrl, apiKey, autoImport, enableTools, contentMode });
       console.log(result.message);
       console.log("Add the plugin to OpenCode, then quit and restart OpenCode. Run 'opencode-observatory import' to import history now.");
     } finally {
@@ -4775,6 +5180,7 @@ try {
         const path = index !== -1 ? process.argv[index + 1] : void 0;
         if (index !== -1 && !path) throw new Error("--database requires a SQLite path");
         const collector = new Collector(config, await inventory([], process.cwd(), detectVersion()), (event) => outbox.enqueue(event));
+        if (config.contentMode !== "off") collector.contentSink = (part) => outbox.enqueueContent(part);
         const result = await importHistory(collector, outbox, path, { all: process.argv.includes("--all"), onProgress: (n) => {
           if (n % 100 === 0) console.log(`Queued ${n} sessions`);
         } });
@@ -4792,7 +5198,7 @@ try {
         }
       } else if (command === "replay") {
         outbox.replay();
-        console.log("All retained metadata is pending again. Run flush to replay it.");
+        console.log("All retained metadata and transcript content is pending again. Run flush to replay it.");
       } else if (command === "status") console.log(JSON.stringify({ url: config.url, installationId: config.installationId, ...outbox.health() }, null, 2));
       else if (command === "mcp-config") console.log(JSON.stringify({ $schema: "https://opencode.ai/config.json", mcp: { servers: { observatory: { type: "remote", url: `${config.url.replace(/\/$/, "")}/mcp`, oauth: false, headers: { Authorization: "Bearer {env:OBSERVATORY_API_KEY}" } } } } }, null, 2));
       else throw new Error("Commands: setup, clear [--all], status, import [--all] [--database PATH], flush, replay, mcp-config");

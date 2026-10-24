@@ -21,7 +21,9 @@ try{
       const apiKey=process.env.OBSERVATORY_API_KEY??await rl.question("Observatory API key (visible input): ");
       const autoImport=(await rl.question("Automatically import past sessions on startup? [y/N]: ")).toLowerCase()==="y";
       const enableTools=(await rl.question("Enable in-OpenCode statistics tools? [Y/n]: ")).toLowerCase()!=="n";
-      const result=await configureObservatory({url:rawUrl,apiKey,autoImport,enableTools});
+      const contentAnswer=(await rl.question("Capture transcript text? [off/text/full] (default off): ")).trim().toLowerCase();
+      const contentMode=contentAnswer==="text"||contentAnswer==="full"?contentAnswer:"off";
+      const result=await configureObservatory({url:rawUrl,apiKey,autoImport,enableTools,contentMode});
       console.log(result.message);
       console.log("Add the plugin to OpenCode, then quit and restart OpenCode. Run 'opencode-observatory import' to import history now.");
     }finally{rl.close();}
@@ -33,11 +35,12 @@ try{
         const index=process.argv.indexOf("--database");const path=index!==-1?process.argv[index+1]:undefined;
         if(index!==-1&&!path)throw new Error("--database requires a SQLite path");
         const collector=new Collector(config,await inventory([],process.cwd(),detectVersion()),event=>outbox.enqueue(event));
+        if(config.contentMode!=="off")collector.contentSink=part=>outbox.enqueueContent(part);
         const result=await importHistory(collector,outbox,path,{all:process.argv.includes("--all"),onProgress:n=>{if(n%100===0)console.log(`Queued ${n} sessions`);}});
         console.log(JSON.stringify(result,null,2));
         try{console.log(JSON.stringify(await outbox.drain(),null,2));}catch(err){console.error(`Upload paused: ${outbox.lastError??(err instanceof Error?err.message:String(err))}. Imported metadata remains queued; run flush later or start OpenCode.`);}
       }else if(command==="flush"){try{console.log(JSON.stringify(await outbox.drain(),null,2));}catch(err){console.error(`Flush paused: ${outbox.lastError??(err instanceof Error?err.message:String(err))}`);}}
-      else if(command==="replay"){outbox.replay();console.log("All retained metadata is pending again. Run flush to replay it.");}
+      else if(command==="replay"){outbox.replay();console.log("All retained metadata and transcript content is pending again. Run flush to replay it.");}
       else if(command==="status")console.log(JSON.stringify({url:config.url,installationId:config.installationId,...outbox.health()},null,2));
       else if(command==="mcp-config")console.log(JSON.stringify({$schema:"https://opencode.ai/config.json",mcp:{servers:{observatory:{type:"remote",url:`${config.url.replace(/\/$/,"")}/mcp`,oauth:false,headers:{Authorization:"Bearer {env:OBSERVATORY_API_KEY}"}}}}},null,2));
       else throw new Error("Commands: setup, clear [--all], status, import [--all] [--database PATH], flush, replay, mcp-config");

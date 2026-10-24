@@ -8,7 +8,9 @@ export declare function importV2History(collector: Collector, outbox: Outbox, pa
     signal?: AbortSignal;
 }): Promise<{
     pending: number;
+    pendingContent: number;
     acknowledged: number;
+    acknowledgedContent: number;
     lastError: string | null;
     sessions: number;
 }>;

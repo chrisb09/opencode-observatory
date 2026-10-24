@@ -1,11 +1,12 @@
-import type { Metadata, Runtime, TelemetryEvent } from "@observatory/contracts";
+import type { Metadata, Runtime, TelemetryEvent, ContentPart, Media } from "@observatory/contracts";
 import type { ClientConfig } from "./config.js";
+import { type ContentKind, type ContentRole } from "./content.js";
 export declare const size: (value: unknown) => number;
 export declare const fingerprint: (secret: string, value: string) => string;
 export declare function safeError(error: any): Metadata;
 export declare function usage(tokens: any, cost: unknown): Metadata;
 export declare class Collector {
-    readonly config: ClientConfig;
+    config: ClientConfig;
     runtime: Runtime;
     readonly emit: (event: TelemetryEvent) => void;
     readonly projectId: string | null;
@@ -27,8 +28,21 @@ export declare class Collector {
         authType: string | null;
         accountSource?: Metadata["accountSource"];
     }>;
+    contentSink?: (part: ContentPart) => void;
     constructor(config: ClientConfig, runtime: Runtime, emit: (event: TelemetryEvent) => void, projectId?: string | null);
     record(kind: TelemetryEvent["kind"], entityId: string, data: Metadata, sessionId?: string | null, messageId?: string | null, historical?: boolean, revision?: number, observedAt?: number): void;
+    content(input: {
+        sessionId: string;
+        messageId: string;
+        partId: string;
+        kind: ContentKind;
+        role: ContentRole;
+        text: string;
+        observedAt: number;
+        media?: Media | null;
+    }): void;
+    contentAttachment(sessionId: string, messageId: string, part: any, observedAt: number, role?: ContentRole): void;
+    private capturePart;
     session(info: any, historical?: boolean, revision?: any): void;
     message(info: any, historical?: boolean, revision?: number): void;
     part(part: any, historical?: boolean, revision?: number): void;

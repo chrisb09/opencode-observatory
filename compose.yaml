@@ -29,6 +29,7 @@ services:
       NODE_ENV: production
       PORT: 7692
       WEB_ROOT: /app/apps/web/dist
+      VAULT_ROOT: /data/vault
       # Optional: set ADMIN_EMAIL and ADMIN_PASSWORD in your .env file to automatically provision
       # the initial administrator on container startup without executing manual commands.
       # If an administrator already exists in the database, these variables are safely ignored.
@@ -36,6 +37,9 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     ports:
       - "7692:7692"
+    volumes:
+      # One Git repository per tenant, never mounted into the web root.
+      - vaultdata:/data/vault
     depends_on:
       db:
         condition: service_healthy
@@ -48,3 +52,5 @@ services:
 volumes:
   pgdata:
     # Named volume for database persistence across container recreations.
+  vaultdata:
+    # Named volume for the per-tenant Git knowledge vaults.

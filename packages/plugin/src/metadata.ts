@@ -1,8 +1,9 @@
 import { createHmac,randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { Metadata,Runtime,TelemetryEvent } from "@observatory/contracts";
+import type { Metadata,Runtime,TelemetryEvent,ContentPart,Media } from "@observatory/contracts";
 import type { ClientConfig } from "./config.js";
+import { makeContentPart,mediaFromPart,mediaMarker,type ContentKind,type ContentRole } from "./content.js";
 export const size=(value:unknown)=>Buffer.byteLength(typeof value==="string"?value:JSON.stringify(value)??"");
 const num=(value:unknown):number|null=>typeof value==="number"&&Number.isFinite(value)&&value>=0?Math.floor(value):null;
 export const fingerprint=(secret:string,value:string)=>`hmac:${createHmac("sha256",secret).update(value).digest("hex")}`;
@@ -23,11 +24,46 @@ export class Collector{
   readonly instanceId=randomUUID();messages=new Map<string,any>();sessions=new Map<string,{projectId:string|null;version:string|null}>();
   accounts=new Map<string,{account:string|null;credential:string|null;authType:string|null;accountSource?:Metadata["accountSource"]}>();
   requestAccounts=new Map<string,{account:string|null;credential:string|null;authType:string|null;accountSource?:Metadata["accountSource"]}>();
-  constructor(readonly config:ClientConfig,public runtime:Runtime,readonly emit:(event:TelemetryEvent)=>void,readonly projectId:string|null=null){}
+  contentSink?: (part:ContentPart)=>void;
+  constructor(public config:ClientConfig,public runtime:Runtime,readonly emit:(event:TelemetryEvent)=>void,readonly projectId:string|null=null){}
   record(kind:TelemetryEvent["kind"],entityId:string,data:Metadata,sessionId:string|null=null,messageId:string|null=null,historical=false,revision=Date.now(),observedAt=data.startedAt??revision){
     const session=sessionId?this.sessions.get(sessionId):undefined;
     this.emit({schemaVersion:1,eventId:randomUUID(),installationId:this.config.installationId,instanceId:this.instanceId,machine:this.config.machine,projectId:session?.projectId??this.projectId,sessionId,messageId,kind,entityId,revision,observedAt,historical,
       runtime:historical?{...this.runtime,opencode:null,provenance:"import-current"}:this.runtime,data:{coverage:historical?"historical":"lifecycle",...data}});
+  }
+  content(input:{sessionId:string;messageId:string;partId:string;kind:ContentKind;role:ContentRole;text:string;observedAt:number;media?:Media|null}){
+    if(!this.contentSink||this.config.contentMode==="off")return;
+    this.contentSink(makeContentPart({installationId:this.config.installationId,...input}));
+  }
+  contentAttachment(sessionId:string,messageId:string,part:any,observedAt:number,role:ContentRole="tool"){
+    if(!this.contentSink||this.config.contentMode==="off")return;
+    const media=mediaFromPart(part);if(!media)return;
+    const partId=String(part?.id??`${messageId}:media:${media.contentHash.slice(7,19)}`);
+    this.content({sessionId,messageId,partId,kind:"media",role,text:mediaMarker(media),observedAt,media});
+  }
+  private capturePart(part:any,message:any,revision:number){
+    if(!this.contentSink||this.config.contentMode==="off")return;
+    const sessionId=part.sessionID??message?.sessionID??null,messageId=part.messageID??message?.id??null;
+    if(!sessionId||!messageId)return;
+    const role:ContentRole=message?.role==="user"?"user":"assistant";
+    const partId=String(part.id??`${messageId}:${part.type??"part"}`);
+    const observedAt=part.time?.start??part.time?.created??message?.time?.created??revision;
+    if(part.type==="text"){
+      if(part.synthetic||part.ignored)return;
+      this.content({sessionId,messageId,partId,kind:role==="user"?"prompt":"response",role,text:String(part.text??""),observedAt});
+    }else if(part.type==="reasoning"){
+      this.content({sessionId,messageId,partId,kind:"reasoning",role:"assistant",text:String(part.text??""),observedAt});
+    }else if(part.type==="tool"){
+      if(this.config.contentMode==="full"){
+        const input=part.state?.input;
+        this.content({sessionId,messageId,partId:`${partId}:input`,kind:"tool_input",role:"assistant",text:typeof input==="string"?input:JSON.stringify(input??{}),observedAt});
+        const output=part.state?.output??part.state?.content;
+        this.content({sessionId,messageId,partId:`${partId}:output`,kind:"tool_output",role:"tool",text:typeof output==="string"?output:JSON.stringify(output??""),observedAt});
+      }
+      for(const attachment of part.state?.attachments??[])this.contentAttachment(sessionId,messageId,attachment,observedAt);
+    }else if(part.type==="file"){
+      this.contentAttachment(sessionId,messageId,part,observedAt,role);
+    }
   }
   session(info:any,historical=false,revision=info.time?.updated??info.time_updated??Date.now()){
     this.sessions.set(info.id,{projectId:info.projectID??info.project_id??null,version:info.version??null});
@@ -78,6 +114,7 @@ export class Collector{
   }
   part(part:any,historical=false,revision=Date.now()){
     const message=this.messages.get(part.messageID),provider=message?.providerID??message?.model?.providerID,model=message?.modelID??message?.model?.modelID;
+    this.capturePart(part,message,revision);
     const account=this.requestAccounts.get(`${part.sessionID}:${message?.parentID??part.messageID}:${provider}:${model}`)??this.accounts.get(part.sessionID);
     const base:Metadata={provider:provider??null,model:model??null,agent:message?.agent??null,variant:message?.variant??null,...(!historical?account:{})};
     if(part.type==="step-finish")this.record("step",part.id,{...base,...usage(part.tokens,part.cost),status:"completed",finishReason:part.reason??null,purpose:message?.summary?"compaction":"chat",startedAt:message?.time?.created??revision},part.sessionID,part.messageID,historical,revision,message?.time?.created??revision);

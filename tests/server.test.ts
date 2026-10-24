@@ -1,16 +1,19 @@
 import {describe,test,expect,beforeAll,afterAll} from "bun:test";
 import {randomUUID,randomBytes} from "node:crypto";
+import {mkdtemp,rm} from "node:fs/promises";
 import {event} from "./fixtures.js";
+import {claimKey} from "../apps/server/src/vault-model.js";
 
 const enabled=!!process.env.TEST_DATABASE_URL;
 if(enabled){process.env.DATABASE_URL=process.env.TEST_DATABASE_URL;process.env.ENCRYPTION_KEY=randomBytes(32).toString("hex");process.env.PUBLIC_URL="http://localhost:7692";}
 describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
-  let app:any,pool:any,tenant:any,userA:string,userB:string,keyA:string,keyB:string,cookie:string,sessionId="ses_"+randomUUID();
+  let app:any,pool:any,tenant:any,userA:string,userB:string,keyA:string,keyB:string,cookie:string,vaultRoot:string,sessionId="ses_"+randomUUID();
   const password="integration-only-password-long";
   const origin={origin:"http://localhost:7692"};
   const bearer=(key:string)=>({authorization:`Bearer ${key}`});
   beforeAll(async()=>{
     const db=await import("../apps/server/src/db.js");pool=db.pool;tenant=db.tenant;await db.migrate();
+    vaultRoot=await mkdtemp("/tmp/opencode/vault-api-test-");process.env.VAULT_ROOT=vaultRoot;
     const security=await import("../apps/server/src/security.js");
     const suffix=randomUUID();userA=await security.createUser(`a-${suffix}@example.test`,password,true);userB=await security.createUser(`b-${suffix}@example.test`,password);
     app=await (await import("../apps/server/src/app.js")).buildApp(false);
@@ -20,12 +23,79 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
   });
   afterAll(async()=>{
     await app?.close();if(pool){await pool.query("DELETE FROM invitations WHERE created_by=ANY($1::uuid[])",[[userA,userB].filter(Boolean)]);await pool.query("DELETE FROM users WHERE id=ANY($1::uuid[])",[[userA,userB].filter(Boolean)]);await pool.end();}
+    if(vaultRoot)await rm(vaultRoot,{recursive:true,force:true});
   });
   test("anonymous users cannot read usage or ingest; browser CSRF and key-management boundaries hold",async()=>{
     expect((await app.inject("/api/analytics")).statusCode).toBe(401);
     expect((await app.inject({method:"POST",url:"/api/ingest",headers:origin,payload:{events:[event()]}})).statusCode).toBe(401);
     expect((await app.inject({method:"POST",url:"/api/keys",headers:{cookie,origin:"https://evil.test"},payload:{name:"bad",scopes:["read"]}})).statusCode).toBe(403);
     expect((await app.inject({method:"POST",url:"/api/keys",headers:bearer(keyA),payload:{name:"bad",scopes:["read"]}})).statusCode).toBe(403);
+  });
+  test("transcript parts and summaries are stored once, revised only by newer sources, and tenant-isolated",async()=>{
+    const installationId=randomUUID(),sessionId=`ses_${randomUUID()}`,textHash=`sha256:${"a".repeat(64)}`,mediaHash=`sha256:${"b".repeat(64)}`;
+    const part={installationId,sessionId,messageId:"msg_memory",partId:"part_memory",kind:"prompt",role:"user",text:"scrubbed transcript text",contentHash:textHash,truncated:false,originalBytes:23,observedAt:1700000000000,media:{contentHash:mediaHash,mime:"image/png",bytes:42,availability:"inline"}};
+    const post=()=>app.inject({method:"POST",url:"/api/content",headers:bearer(keyA),payload:{parts:[part]}});
+    const first=await post();expect(first.statusCode).toBe(200);expect(first.json().mediaPending).toEqual([mediaHash]);
+    expect((await post()).json().mediaPending).toEqual([mediaHash]);
+    const summary={installationId,sessionId,targetKind:"session",targetId:sessionId,summaryShort:"first",summaryDetailed:"details",keyDecisions:[],filesTouched:[],concepts:[],generatorModel:"test/model",promptVersion:"v1",sourceHash:textHash};
+    expect((await app.inject({method:"POST",url:"/api/summaries",headers:bearer(keyA),payload:summary})).statusCode).toBe(200);
+    expect((await app.inject({method:"POST",url:"/api/summaries",headers:bearer(keyA),payload:{...summary,promptVersion:"v2",summaryShort:"second"}})).statusCode).toBe(200);
+    const stored=await tenant(userA,async(db:any)=>({
+      content:(await db.query("SELECT content_text,truncated FROM session_contents WHERE session_id=$1",[sessionId])).rows,
+      media:(await db.query("SELECT mime,bytes,availability FROM media_assets WHERE content_hash=$1",[mediaHash])).rows,
+      summaries:(await db.query("SELECT summary_short,prompt_version FROM summaries WHERE session_id=$1",[sessionId])).rows,
+    }));
+    expect(stored.content).toEqual([{content_text:"scrubbed transcript text",truncated:false}]);
+    expect(stored.media).toEqual([{mime:"image/png",bytes:"42",availability:"inline"}]);
+    expect(stored.summaries).toEqual([{summary_short:"second",prompt_version:"v2"}]);
+    for(const table of ["session_contents","summaries"]){
+      expect(await tenant(userB,async(db:any)=>(await db.query(`SELECT count(*)::int AS n FROM ${table} WHERE session_id=$1`,[sessionId])).rows[0].n)).toBe(0);
+    }
+    expect(await tenant(userB,async(db:any)=>(await db.query("SELECT count(*)::int AS n FROM media_assets WHERE content_hash=$1",[mediaHash])).rows[0].n)).toBe(0);
+  });
+  test("vault claims fold out of order, commit with provenance, and remain tenant-isolated",async()=>{
+    const concept=`test/vault-${randomUUID()}`,installationId=randomUUID();
+    const ref=(sessionId:string,observedAt:number)=>({installationId,sessionId,messageId:`${sessionId}:msg`,observedAt});
+    const base={concept,subject:"test.value",modality:"fact",scope:"global",scopeValue:null,evidenceTier:"tool_verified",singleValued:true};
+    const post=(payload:any)=>app.inject({method:"POST",url:"/api/vault/claims",headers:bearer(keyA),payload});
+    const october={...base,statement:"The value is 2.",polarity:"affirm",evidence:[ref("ses_oct",2000)]};
+    const march={...base,statement:"The value is 1.",polarity:"affirm",evidence:[ref("ses_mar",1000)]};
+    expect((await post({claims:[october],source:{installationId,machine:"test-machine",rootSessionId:"ses_oct",model:"test/model",promptVersion:"v1"}})).statusCode).toBe(200);
+    expect((await post({claims:[march],source:{installationId,machine:"test-machine",rootSessionId:"ses_mar",model:"test/model",promptVersion:"v1"}})).statusCode).toBe(200);
+    const query=encodeURIComponent(concept);
+    const claims=(await app.inject({url:`/api/vault/claims?concept=${query}`,headers:bearer(keyA)})).json();
+    expect(claims.total).toBe(2);
+    expect(claims.items.find((item:any)=>item.statement==="The value is 1.").status).toBe("superseded");
+    expect(claims.items.find((item:any)=>item.statement==="The value is 2.").status).toBe("active");
+    const concepts=(await app.inject({url:"/api/vault/concepts",headers:bearer(keyA)})).json();
+    expect(concepts.some((item:any)=>item.concept===concept)).toBe(true);
+    const note=(await app.inject({url:`/api/vault/note?concept=${query}`,headers:bearer(keyA)})).json();
+    expect(note.markdown).toContain("## History");
+    expect(note.markdown).toContain("The value is 2.");
+    const log=(await app.inject({url:`/api/vault/log?concept=${query}`,headers:bearer(keyA)})).json();
+    expect(log[0].trailers["X-Observatory-Machine"]).toBe("test-machine");
+    expect(log[0].trailers["X-Observatory-Root-Session"]).toBe("ses_mar");
+    expect((await app.inject({url:`/api/vault/claims?concept=${query}`,headers:bearer(keyB)})).json().total).toBe(0);
+    expect((await app.inject({url:`/api/vault/note?concept=${query}`,headers:bearer(keyB)})).statusCode).toBe(404);
+    const mcp=await app.inject({method:"POST",url:"/mcp",headers:{...bearer(keyA),...origin,"content-type":"application/json",accept:"application/json, text/event-stream"},payload:{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"search_vault",arguments:{query:"value",concept}}}});
+    expect(mcp.statusCode).toBe(200);
+    expect(JSON.parse(mcp.json().result.content[0].text).claims.some((item:any)=>item.concept===concept)).toBe(true);
+  });
+  test("late cross-concept contradictions reload their target concept",async()=>{
+    const installationId=randomUUID(),conceptA=`test/vault-source-${randomUUID()}`,conceptB=`test/vault-target-${randomUUID()}`;
+    const ref=(sessionId:string,observedAt:number)=>({installationId,sessionId,messageId:`${sessionId}:msg`,observedAt});
+    const target={concept:conceptB,subject:"test.target",statement:"The target is true.",polarity:"affirm",modality:"fact",scope:"global",scopeValue:null,evidenceTier:"tool_verified",singleValued:true,evidence:[ref("ses_target",1000)]};
+    const targetKey=claimKey({concept:conceptB,scope:"global",subject:"test.target",polarity:"affirm",statement:"The target is true."});
+    const source={concept:conceptA,subject:"test.source",statement:"The target is false.",polarity:"deny",modality:"fact",scope:"global",scopeValue:null,evidenceTier:"tool_verified",singleValued:true,evidence:[ref("ses_source",1000)],contradicts:[targetKey]};
+    const post=(claims:any[])=>app.inject({method:"POST",url:"/api/vault/claims",headers:bearer(keyA),payload:{claims}});
+    expect((await post([target])).statusCode).toBe(200);
+    expect((await post([source])).statusCode).toBe(200);
+    const targetClaims=(await app.inject({url:`/api/vault/claims?concept=${encodeURIComponent(conceptB)}`,headers:bearer(keyA)})).json();
+    expect(targetClaims.items[0].status).toBe("disputed");
+    const conflicts=(await app.inject({url:"/api/vault/conflicts",headers:bearer(keyA)})).json();
+    expect(conflicts.items.some((item:any)=>item.class==="explicit"&&[item.claim_a,item.claim_b].includes(targetKey))).toBe(true);
+    const targetNote=(await app.inject({url:`/api/vault/note?concept=${encodeURIComponent(conceptB)}`,headers:bearer(keyA)})).json();
+    expect(targetNote.markdown).toContain("## Disputed");
   });
   test("acknowledged duplicates and message/step snapshots do not double-count usage",async()=>{
     const step=event({sessionId,entityId:"part_canonical",messageId:"msg_canonical"});
@@ -105,7 +175,7 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     expect((await app.inject({url:`/api/entities/step?sessionId=${sessionId}`,headers:bearer(keyB)})).json().total).toBe(0);
     const role=await pool.query("SELECT rolsuper,rolbypassrls FROM pg_roles WHERE rolname=current_user");expect(role.rows[0].rolsuper).toBe(false);expect(role.rows[0].rolbypassrls).toBe(false);
     const hidden=await tenant(userB,async(db:any)=>(await db.query("SELECT count(*)::int AS n FROM entities WHERE session_id=$1",[sessionId])).rows[0].n);expect(hidden).toBe(0);
-    for(const table of ["usage_facts","usage_hourly","usage_dirty","usage_rollup_state"]){
+    for(const table of ["usage_facts","usage_hourly","usage_dirty","usage_rollup_state","session_contents","media_assets","summaries","vault_concepts","vault_claims","vault_edges","vault_conflicts","vault_jobs","librarian_decisions"]){
       expect(await tenant(userB,async(db:any)=>(await db.query(`SELECT count(*)::int AS n FROM ${table} WHERE user_id=$1`,[userA])).rows[0].n)).toBe(0);
     }
   });

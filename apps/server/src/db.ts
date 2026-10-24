@@ -1,5 +1,6 @@
 import pg from "pg";
 import { migrateRollups } from "./rollup-schema.js";
+import { migrateMemory } from "./memory-schema.js";
 export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
 export async function tenant<T>(userId: string, run: (db: pg.PoolClient) => Promise<T>): Promise<T> {
   const db = await pool.connect();
@@ -134,7 +135,8 @@ export async function migrate() {
       GRANT SELECT ON market_rates TO PUBLIC;
     `);
     await migrateRollups(db);
-    for (const table of ["entities", "events", "account_aliases", "prices", "account_assignments", "usage_facts", "usage_hourly", "usage_dirty", "usage_rollup_state"]) {
+    await migrateMemory(db);
+    for (const table of ["entities", "events", "account_aliases", "prices", "account_assignments", "usage_facts", "usage_hourly", "usage_dirty", "usage_rollup_state", "session_contents", "media_assets", "summaries", "vault_concepts", "vault_claims", "vault_edges", "vault_conflicts", "vault_jobs", "librarian_decisions"]) {
       await db.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
       await db.query(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`);
       await db.query(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='${table}' AND policyname='tenant_isolation') THEN
