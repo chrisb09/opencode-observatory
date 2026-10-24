@@ -4713,7 +4713,7 @@ try {
         outbox.replay();
         console.log("All retained metadata is pending again. Run flush to replay it.");
       } else if (command === "status") console.log(JSON.stringify(outbox.health(), null, 2));
-      else if (command === "mcp-config") console.log(JSON.stringify({ $schema: "https://opencode.ai/config.json", mcp: { observatory: { type: "remote", url: `${config.url.replace(/\/$/, "")}/mcp`, oauth: false, headers: { Authorization: "Bearer {env:OBSERVATORY_API_KEY}" } } } }, null, 2));
+      else if (command === "mcp-config") console.log(JSON.stringify({ $schema: "https://opencode.ai/config.json", mcp: { servers: { observatory: { type: "remote", url: `${config.url.replace(/\/$/, "")}/mcp`, oauth: false, headers: { Authorization: "Bearer {env:OBSERVATORY_API_KEY}" } } } } }, null, 2));
       else throw new Error("Commands: setup, clear [--all], status, import [--all] [--database PATH], flush, replay, mcp-config");
     } finally {
       await outbox.close();
