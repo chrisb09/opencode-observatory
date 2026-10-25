@@ -226,3 +226,134 @@ export async function getSessionSummaries(userId: string, query: unknown) {
     return rows.rows;
   });
 }
+
+/**
+ * Dashboard coverage: how much of the session corpus has raw text, summaries,
+ * and vault material, plus the stored size. Counts are tenant-scoped by RLS.
+ */
+export async function memoryCoverage(userId: string) {
+  return tenant(userId, async db => {
+    const totalSessions = Number(
+      (await db.query(`SELECT count(*)::int AS n FROM entities WHERE user_id=$1 AND kind='session'`, [userId])).rows[0]?.n ?? 0,
+    );
+    const contentSessions = Number(
+      (await db.query(`SELECT count(DISTINCT (installation_id,session_id))::int AS n FROM session_contents WHERE user_id=$1`, [userId])).rows[0]?.n ?? 0,
+    );
+    const summarySessions = Number(
+      (await db.query(`SELECT count(DISTINCT (installation_id,session_id))::int AS n FROM summaries WHERE user_id=$1 AND target_kind='session'`, [userId])).rows[0]?.n ?? 0,
+    );
+    const content = (await db.query(
+      `SELECT count(*)::int AS parts,
+              coalesce(sum(octet_length(content_text)),0)::bigint AS stored_bytes,
+              coalesce(sum(coalesce(original_bytes,octet_length(content_text))),0)::bigint AS original_bytes,
+              count(*) FILTER (WHERE truncated)::int AS truncated_parts
+       FROM session_contents WHERE user_id=$1`,
+      [userId],
+    )).rows[0];
+    const media = (await db.query(
+      `SELECT count(*)::int AS assets,
+              coalesce(sum(bytes),0)::bigint AS referenced_bytes,
+              count(*) FILTER (WHERE descriptor_source='none')::int AS pending_descriptions
+       FROM media_assets WHERE user_id=$1`,
+      [userId],
+    )).rows[0];
+    const summaries = (await db.query(
+      `SELECT count(*)::int AS total,
+              count(DISTINCT (installation_id,session_id))::int AS sessions,
+              count(*) FILTER (WHERE target_kind='session')::int AS session_summaries,
+              count(*) FILTER (WHERE target_kind='message')::int AS message_summaries,
+              coalesce(sum(octet_length(summary_short)+octet_length(summary_detailed)
+                +octet_length(key_decisions::text)+octet_length(files_touched::text)+octet_length(concepts::text)),0)::bigint AS stored_bytes
+       FROM summaries WHERE user_id=$1`,
+      [userId],
+    )).rows[0];
+    const vaultConcepts = Number(
+      (await db.query(`SELECT count(*)::int AS n FROM vault_concepts WHERE user_id=$1`, [userId])).rows[0]?.n ?? 0,
+    );
+    const vaultClaims = (await db.query(
+      `SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE status='active')::int AS active,
+              count(*) FILTER (WHERE status='disputed')::int AS disputed
+       FROM vault_claims WHERE user_id=$1`,
+      [userId],
+    )).rows[0];
+    const openConflicts = Number(
+      (await db.query(`SELECT count(*)::int AS n FROM vault_conflicts WHERE user_id=$1 AND status='open'`, [userId])).rows[0]?.n ?? 0,
+    );
+    return {
+      sessions: { total: totalSessions, withContent: contentSessions, withSummary: summarySessions },
+      content: {
+        parts: Number(content?.parts ?? 0),
+        sessions: contentSessions,
+        storedBytes: Number(content?.stored_bytes ?? 0),
+        originalBytes: Number(content?.original_bytes ?? 0),
+        truncatedParts: Number(content?.truncated_parts ?? 0),
+      },
+      media: {
+        assets: Number(media?.assets ?? 0),
+        referencedBytes: Number(media?.referenced_bytes ?? 0),
+        pendingDescriptions: Number(media?.pending_descriptions ?? 0),
+      },
+      summaries: {
+        total: Number(summaries?.total ?? 0),
+        sessions: Number(summaries?.sessions ?? 0),
+        sessionSummaries: Number(summaries?.session_summaries ?? 0),
+        messageSummaries: Number(summaries?.message_summaries ?? 0),
+        storedBytes: Number(summaries?.stored_bytes ?? 0),
+      },
+      vault: {
+        concepts: vaultConcepts,
+        claims: Number(vaultClaims?.total ?? 0),
+        activeClaims: Number(vaultClaims?.active ?? 0),
+        disputedClaims: Number(vaultClaims?.disputed ?? 0),
+        openConflicts,
+      },
+      generatedAt: Date.now(),
+    };
+  });
+}
+
+/** Full memory detail for one session, used by the session inspector. */
+export async function sessionMemory(userId: string, query: unknown) {
+  const { sessionId, installationId } = z
+    .object({ sessionId: z.string().min(1).max(256), installationId: z.string().uuid() })
+    .strict()
+    .parse(query);
+  return tenant(userId, async db => {
+    const summaries = await db.query(
+      `SELECT target_kind,target_id,summary_short,summary_detailed,key_decisions,files_touched,concepts,
+              generator_model,prompt_version,updated_at
+       FROM summaries WHERE user_id=$1 AND installation_id=$2 AND session_id=$3
+       ORDER BY target_kind,target_id`,
+      [userId, installationId, sessionId],
+    );
+    const content = await db.query(
+      `SELECT kind,count(*)::int AS parts,
+              coalesce(sum(octet_length(content_text)),0)::bigint AS stored_bytes,
+              coalesce(sum(coalesce(original_bytes,octet_length(content_text))),0)::bigint AS original_bytes,
+              count(*) FILTER (WHERE truncated)::int AS truncated_parts,
+              min(observed_at) AS first_observed,max(observed_at) AS last_observed
+       FROM session_contents WHERE user_id=$1 AND installation_id=$2 AND session_id=$3
+       GROUP BY kind ORDER BY kind`,
+      [userId, installationId, sessionId],
+    );
+    const totals = content.rows.reduce(
+      (value, row) => ({
+        parts: value.parts + Number(row.parts),
+        storedBytes: value.storedBytes + Number(row.stored_bytes),
+        originalBytes: value.originalBytes + Number(row.original_bytes),
+        truncatedParts: value.truncatedParts + Number(row.truncated_parts),
+      }),
+      { parts: 0, storedBytes: 0, originalBytes: 0, truncatedParts: 0 },
+    );
+    return {
+      sessionId,
+      installationId,
+      summaries: summaries.rows,
+      content: content.rows,
+      totals,
+      media: { parts: Number(content.rows.find(row => row.kind === "media")?.parts ?? 0) },
+      generatedAt: Date.now(),
+    };
+  });
+}

@@ -52,6 +52,23 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
       expect(await tenant(userB,async(db:any)=>(await db.query(`SELECT count(*)::int AS n FROM ${table} WHERE session_id=$1`,[sessionId])).rows[0].n)).toBe(0);
     }
     expect(await tenant(userB,async(db:any)=>(await db.query("SELECT count(*)::int AS n FROM media_assets WHERE content_hash=$1",[mediaHash])).rows[0].n)).toBe(0);
+    const sessionEvent=event({installationId,sessionId,kind:"session",entityId:sessionId,messageId:null,data:{title:"Memory coverage test",status:"completed",startedAt:1700000000000,endedAt:1700000001000}});
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[sessionEvent]}})).statusCode).toBe(200);
+    const coverage=(await app.inject({url:"/api/memory/coverage",headers:bearer(keyA)})).json();
+    expect(coverage.sessions.withContent).toBeGreaterThanOrEqual(1);
+    expect(coverage.sessions.withSummary).toBeGreaterThanOrEqual(1);
+    expect(coverage.content.parts).toBeGreaterThanOrEqual(1);
+    expect(coverage.summaries.total).toBeGreaterThanOrEqual(1);
+    expect(coverage.media.assets).toBeGreaterThanOrEqual(1);
+    const memory=(await app.inject({url:`/api/memory/session?sessionId=${encodeURIComponent(sessionId)}&installationId=${installationId}`,headers:bearer(keyA)})).json();
+    expect(memory.summaries.some((item:any)=>item.target_kind==="session"&&item.summary_short==="second")).toBe(true);
+    expect(memory.content.some((item:any)=>item.kind==="prompt"&&item.parts===1)).toBe(true);
+    expect(memory.media.parts).toBe(0);
+    const listed=(await app.inject({url:`/api/entities/session?sessionId=${sessionId}`,headers:bearer(keyA)})).json().items.find((item:any)=>item.session_id===sessionId);
+    expect(listed.data.summaryShort).toBe("second");
+    expect(listed.data.contentParts).toBe(1);
+    expect(Number(listed.data.contentBytes)).toBeGreaterThan(0);
+    expect((await app.inject({url:"/api/memory/coverage",headers:bearer(keyB)})).json().content.parts).toBe(0);
   });
   test("vault claims fold out of order, commit with provenance, and remain tenant-isolated",async()=>{
     const concept=`test/vault-${randomUUID()}`,installationId=randomUUID();

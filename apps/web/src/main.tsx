@@ -22,6 +22,14 @@ const ms=(v:any)=>v==null?"—":Number(v)>1000?`${(Number(v)/1000).toFixed(1)}s`
 const date=(v:any)=>new Date(Number(v)).toLocaleString();
 const short=(v:any)=>v?String(v).replace("hmac:","").slice(0,14):"Unknown";
 const percent=(v:any)=>v==null?"—":`${(Number(v)*100).toFixed(1)}%`;
+const bytes=(v:any)=>{
+  const value=Number(v);
+  if(!Number.isFinite(value)||value<=0)return "0 B";
+  const units=["B","KB","MB","GB","TB"];
+  let scaled=value,index=0;
+  while(scaled>=1024&&index<units.length-1){scaled/=1024;index++;}
+  return `${scaled.toFixed(index>0&&scaled<10?1:0)} ${units[index]}`;
+};
 const clientCache=new Map<string,{expires:number,value:Promise<any>}>();
 function clearClientCache(){clientCache.clear();}
 
@@ -100,9 +108,21 @@ function App(){
   const[serverSort,setServerSort]=useState({key:"observed_at",dir:"desc" as "asc"|"desc"});
   const[dimensions,setDimensions]=useState<any[]>([]),[stats,setStats]=useState<any>(null),[rows,setRows]=useState<Entity[]>([]),[total,setTotal]=useState(0),[page,setPage]=useState(0),[tick,setTick]=useState(0),[selected,setSelected]=useState<Entity|null>(null),[session,setSession]=useState<Entity|null>(null);
   const[loadedAt,setLoadedAt]=useState<number|null>(null),[listingStats,setListingStats]=useState<any>(null);
+  const[coverage,setCoverage]=useState<any>(null),[memory,setMemory]=useState<any>(null);
 
   useEffect(()=>{request("/api/auth/me").then(setUser).catch(()=>{}).finally(()=>setChecking(false));},[]);
   useEffect(()=>{if(user)request("/api/dimensions").then(setDimensions).catch(e=>setError(e.message));},[user,tick]);
+  useEffect(()=>{
+    if(!user||view!=="sessions")return;
+    request("/api/memory/coverage").then(setCoverage).catch(()=>setCoverage(null));
+  },[user,view,tick]);
+  useEffect(()=>{
+    setMemory(null);
+    if(!selected||view!=="sessions"||session)return;
+    const abort=new AbortController();
+    request(`/api/memory/session?sessionId=${encodeURIComponent(selected.entity_id)}&installationId=${encodeURIComponent(selected.installation_id)}`,undefined,undefined,abort.signal).then(setMemory).catch(()=>{});
+    return ()=>abort.abort();
+  },[selected,view,session]);
 
   const timeframe=useMemo(()=>{const to=Date.now();return range==="custom"?{from:customFrom?new Date(customFrom).getTime():undefined,to:customTo?new Date(customTo).getTime():to}:range==="all"?{from:undefined,to}:{from:to-Number(range)*86400000,to};},[range,customFrom,customTo,tick]);
   const query=useCallback((listing=true)=>{
@@ -246,14 +266,16 @@ function App(){
         <p className="footnote">Total tokens include cached prompt tokens and completion including reasoning, without adding overlapping categories twice. Unknown pricing stays unavailable. Market value excludes subscription fees; recorded cost is reported usage or an OpenCode estimate, not a verified invoice.</p>
       </>}
 
+      {view==="sessions"&&!session&&coverage&&<MemoryCoverage data={coverage}/>}
       {view==="sessions"&&!session&&<section className="panel">
-        <div className="panel-title"><div><h2>Sessions</h2><p>{n(total)} sessions recorded · Click column headers to sort or click a row to inspect</p></div><span className="badge neutral">Metadata</span></div>
+        <div className="panel-title"><div><h2>Sessions</h2><p>{n(total)} sessions recorded · Click column headers to sort or click a row to inspect</p></div><span className="badge neutral">Metadata + memory</span></div>
         <div className="table-wrap"><table><thead><tr>
           <Th label="Session" sortKey="entity_id" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
           <Th label="Agent" sortKey="agent" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
           <Th label="Models" sortKey="model" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
           <Th label="Machine" sortKey="machine" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
           <Th label="Status" sortKey="status" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
+          <th>Memory</th>
           <Th label="Input / Output" sortKey="inputTokens" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
           <Th label="Total" sortKey="totalTokens" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
           <Th label="Duration" sortKey="durationMs" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
@@ -261,11 +283,12 @@ function App(){
           <Th label="Market rate" sortKey="marketCost" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort} align="right"/>
           <Th label="Recorded" sortKey="observed_at" currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
         </tr></thead><tbody>{rowsSort.sorted.map(row=><tr key={row.installation_id+row.entity_id} className="clickable" tabIndex={0} onClick={()=>setSelected(row)} onKeyDown={e=>{if(e.key==="Enter")setSelected(row);}}>
-          <td><strong>{row.data.title||short(row.entity_id)}</strong><small className="mono">{row.entity_id}</small></td>
+          <td><strong title={row.data.summaryShort??undefined}>{row.data.title||short(row.entity_id)}</strong><small className="mono">{row.entity_id}</small>{row.data.summaryShort&&<small className="session-summary" title={row.data.summaryShort}>{row.data.summaryShort}</small>}</td>
           <td><span className="badge neutral">{row.data.agents?.length ? row.data.agents.join(", ") : (row.data.agent ?? "—")}</span></td>
           <td>{row.data.models?.length > 1 ? <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{row.data.models.map((m:string)=><span key={m} className="badge neutral" style={{fontSize:9}}>{m}</span>)}</div> : (row.data.models?.[0] ?? row.data.model ?? row.data.provider ?? "—")}</td>
           <td>{row.machine}</td>
           <td><Badge status={row.data.status??"completed"}/></td>
+          <td><div className="memory-badges">{row.data.contentParts>0?<span className="badge neutral" title={`${n(row.data.contentParts)} transcript parts · ${bytes(row.data.contentBytes)} stored`}>Text · {bytes(row.data.contentBytes)}</span>:<span className="badge neutral">No text</span>}{row.data.summaryShort&&<span className="badge completed">Summary</span>}</div></td>
           <td>{row.data.inputTokens!=null?`${n(row.data.inputTokens)} / ${n(row.data.outputTokens)}`:"—"}</td>
           <td>{n(row.data.totalTokens)}</td>
           <td>{ms(row.data.durationMs)}</td>
@@ -345,7 +368,7 @@ function App(){
       <footer>OpenCode Observatory <span>{loadedAt?`Updated ${new Date(loadedAt).toLocaleTimeString()}`:"Your private AI usage workspace"}</span></footer>
     </main>
 
-    {selected&&<div className="overlay" onClick={()=>setSelected(null)}><section className="drawer" role="dialog" aria-modal="true" aria-label="Record metadata" onClick={e=>e.stopPropagation()}><button className="icon close" aria-label="Close details" onClick={()=>setSelected(null)}><X/></button><div className="eyebrow">RECORD INSPECTOR</div><h2>{selected.data.title??selected.data.model??selected.data.tool??short(selected.entity_id)}</h2><p className="mono">{selected.entity_id}</p>{view==="sessions"&&!session&&<button className="button primary" onClick={()=>{setSession(selected);setSelected(null);setPage(0);}}>Explore model steps<ArrowUpRight size={16}/></button>}<h3>Metadata</h3><dl>{Object.entries(selected.data).map(([k,v])=><div key={k}><dt>{k.replace(/([A-Z])/g," $1")}</dt><dd>{v==null?"Unavailable":["cost","marketCost","cacheSavings"].includes(k)?money(v):String(v)}</dd></div>)}</dl><h3>Runtime at capture</h3><VersionInventory runtime={selected.runtime}/>{selected.historical&&<div className="notice">Historical request/plugin versions were not recorded by OpenCode. The import-time inventory is not evidence of versions used for these requests.</div>}</section></div>}
+    {selected&&<div className="overlay" onClick={()=>setSelected(null)}><section className="drawer" role="dialog" aria-modal="true" aria-label="Record metadata" onClick={e=>e.stopPropagation()}><button className="icon close" aria-label="Close details" onClick={()=>setSelected(null)}><X/></button><div className="eyebrow">RECORD INSPECTOR</div><h2>{selected.data.title??selected.data.model??selected.data.tool??short(selected.entity_id)}</h2><p className="mono">{selected.entity_id}</p>{view==="sessions"&&!session&&<button className="button primary" onClick={()=>{setSession(selected);setSelected(null);setPage(0);}}>Explore model steps<ArrowUpRight size={16}/></button>}{memory&&view==="sessions"&&!session&&<MemoryDetail memory={memory}/>}<h3>Metadata</h3><dl>{Object.entries(selected.data).map(([k,v])=><div key={k}><dt>{k.replace(/([A-Z])/g," $1")}</dt><dd>{v==null?"Unavailable":["cost","marketCost","cacheSavings"].includes(k)?money(v):String(v)}</dd></div>)}</dl><h3>Runtime at capture</h3><VersionInventory runtime={selected.runtime}/>{selected.historical&&<div className="notice">Historical request/plugin versions were not recorded by OpenCode. The import-time inventory is not evidence of versions used for these requests.</div>}</section></div>}
   </div>;
 }
 
@@ -358,6 +381,46 @@ function Login({onLogin}:{onLogin:(user:User)=>void}){
 function ChartPlaceholder(){return <div className="charts-grid primary-charts" aria-busy="true" role="status" aria-label="Loading charts"><section className="panel chart-loading"><div className="panel-title"><div><h2>Usage over time</h2><p>Loading chart data…</p></div></div><div className="chart-placeholder" aria-hidden="true"/></section><section className="panel chart-loading"><div className="panel-title"><div><h2>Activity</h2><p>Loading chart data…</p></div></div><div className="chart-placeholder" aria-hidden="true"/></section></div>;}
 function Stat({label,value,hint,icon:Icon}:any){return <section className="stat"><div className="stat-label">{label}<Icon size={17}/></div><strong>{value}</strong><p>{hint}</p></section>;}
 function Mini({label,value}:any){return <div className="mini"><span>{label}</span><strong>{value}</strong></div>;}
+function MemoryCoverage({data}:{data:any}){
+  const sessions=data.sessions??{},content=data.content??{},summaries=data.summaries??{},media=data.media??{},vault=data.vault??{};
+  const pct=(value:number,total:number)=>total>0?`${Math.round(value/total*100)}%`:"—";
+  return <section className="panel memory-coverage">
+    <div className="panel-title"><div><h2>Memory coverage</h2><p>Transcripts and summaries captured across all machines. Media is referenced by hash; only descriptors are stored.</p></div><span className="badge neutral">{pct(Number(sessions.withSummary??0),Number(sessions.total??0))} summarized</span></div>
+    <div className="health-grid">
+      <Mini label="Sessions with text" value={`${n(sessions.withContent)} / ${n(sessions.total)}`}/>
+      <Mini label="Sessions with summary" value={`${n(sessions.withSummary)} / ${n(sessions.total)}`}/>
+      <Mini label="Stored text" value={`${bytes(content.storedBytes)} · ${n(content.parts)} parts`}/>
+      <Mini label="Stored summaries" value={`${bytes(summaries.storedBytes)} · ${n(summaries.total)}`}/>
+      <Mini label="Referenced media" value={`${bytes(media.referencedBytes)} · ${n(media.assets)}`}/>
+      <Mini label="Knowledge vault" value={`${n(vault.claims)} claims · ${n(vault.concepts)} concepts${vault.openConflicts?` · ${n(vault.openConflicts)} open`:""}`}/>
+    </div>
+    <div className="coverage-note"><p>Text is deduplicated by session/message/part; tool output is capped at 8 KB. “Referenced media” is the original file size described by hashes, not bytes stored by Observatory. Summary bytes include message and session digests.</p></div>
+  </section>;
+}
+function MemoryDetail({memory}:{memory:any}){
+  const session=(memory.summaries??[]).find((item:any)=>item.target_kind==="session");
+  const totals=memory.totals??{};
+  const updated=session?.updated_at?new Date(session.updated_at).toLocaleString():"";
+  return <div className="memory-detail">
+    <h3>Session summary</h3>
+    {session?<>
+      <p className="memory-summary">{session.summary_short}</p>
+      {session.summary_detailed&&<p>{session.summary_detailed}</p>}
+      {!!session.key_decisions?.length&&<><strong>Key decisions</strong><ul>{session.key_decisions.map((value:any)=><li key={value}>{value}</li>)}</ul></>}
+      {!!session.files_touched?.length&&<><strong>Files</strong><div className="chips">{session.files_touched.map((value:any)=><span className="badge neutral" key={value}>{value}</span>)}</div></>}
+      {!!session.concepts?.length&&<><strong>Concepts</strong><div className="chips">{session.concepts.map((value:any)=><span className="badge neutral" key={value}>{value}</span>)}</div></>}
+      <p><small>Generated by {session.generator_model} · {updated}</small></p>
+    </>:<div className="notice">No session summary yet. Raw text may already be captured; run the V2 <code>observatory_summarize</code> tool to generate summaries and claims.</div>}
+    <h3>Memory stored</h3>
+    <dl>
+      <div><dt>Transcript parts</dt><dd>{n(totals.parts)}</dd></div>
+      <div><dt>Stored text</dt><dd>{bytes(totals.storedBytes)}</dd></div>
+      <div><dt>Original text</dt><dd>{bytes(totals.originalBytes)}</dd></div>
+      <div><dt>Truncated parts</dt><dd>{n(totals.truncatedParts)}</dd></div>
+      <div><dt>Media descriptors</dt><dd>{n(memory.media?.parts)}</dd></div>
+    </dl>
+  </div>;
+}
 function Badge({status}:{status:string}){return <span className={`badge ${status}`}><i/>{status}</span>;}
 function Empty(){return <div className="empty"><Activity size={30}/><h3>No data in this view yet</h3><p>Connect a client or import past sessions.<br/>Try a wider timeframe if your client is already connected.</p></div>;}
 function VersionInventory({runtime}:any){return <div className="versions"><div><span>OpenCode</span><strong>{runtime?.opencode??"Not recorded"}</strong></div><div><span>Collector</span><strong>{runtime?.collector??"Unknown"}</strong></div><div><span>Provenance</span><strong>{runtime?.provenance??"Unknown"}</strong></div>{runtime?.plugins?.map((p:any)=><div key={p.spec}><span title={p.spec}>{p.name}</span><strong>{p.version??"Unknown"}<small>{p.source}</small></strong></div>)}{!runtime?.plugins?.length&&<p>No plugin inventory recorded.</p>}</div>;}

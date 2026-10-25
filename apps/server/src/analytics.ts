@@ -156,7 +156,49 @@ async function entityPage(userId: string, kind: string, query: unknown) {
       return { ...row, data: { ...row.data, ...metrics, models: distinctModels, agents: distinctAgents } };
     }).filter(row => !f.status || row.data.status === f.status);
     const sorted = sortRows(filtered, f, row => f.sortBy === "observed_at" ? Number(row.observed_at) : f.sortBy === "machine" || f.sortBy === "entity_id" ? row[f.sortBy] : row.data[f.sortBy]);
-    return { items: sorted.slice(f.offset, f.offset + f.limit), total: sorted.length, limit: f.limit, offset: f.offset };
+    const page = sorted.slice(f.offset, f.offset + f.limit);
+    const keys = page.map(row => ({ installation_id: row.installation_id, session_id: row.entity_id }));
+    const [summaryRows, contentRows] = keys.length
+      ? await tenant(userId, async db => {
+          const summaries = await db.query(
+            `SELECT s.installation_id,s.session_id,s.summary_short,s.updated_at
+             FROM summaries s
+             JOIN jsonb_to_recordset($2::jsonb) AS p(installation_id uuid,session_id text)
+               ON s.installation_id=p.installation_id AND s.session_id=p.session_id
+             WHERE s.user_id=$1 AND s.target_kind='session'`,
+            [userId, JSON.stringify(keys)],
+          );
+          const contents = await db.query(
+            `SELECT c.installation_id,c.session_id,count(*)::int AS parts,
+                    coalesce(sum(octet_length(c.content_text)),0)::bigint AS bytes
+             FROM session_contents c
+             JOIN jsonb_to_recordset($2::jsonb) AS p(installation_id uuid,session_id text)
+               ON c.installation_id=p.installation_id AND c.session_id=p.session_id
+             WHERE c.user_id=$1
+             GROUP BY c.installation_id,c.session_id`,
+            [userId, JSON.stringify(keys)],
+          );
+          return [summaries.rows, contents.rows] as const;
+        })
+      : ([[], []] as const);
+    const summaryMap = new Map(summaryRows.map(row => [`${row.installation_id}:${row.session_id}`, row]));
+    const contentMap = new Map(contentRows.map(row => [`${row.installation_id}:${row.session_id}`, row]));
+    const items = page.map(row => {
+      const key = `${row.installation_id}:${row.entity_id}`;
+      const summary = summaryMap.get(key);
+      const content = contentMap.get(key);
+      return {
+        ...row,
+        data: {
+          ...row.data,
+          summaryShort: summary?.summary_short ?? null,
+          summaryUpdatedAt: summary?.updated_at ?? null,
+          contentParts: Number(content?.parts ?? 0),
+          contentBytes: Number(content?.bytes ?? 0),
+        },
+      };
+    });
+    return { items, total: sorted.length, limit: f.limit, offset: f.offset };
   }
   if (f.account || f.credential || f.sortBy === "marketCost") {
     const w = where(f, "e", 2, false), n = w.values.length + 2;
