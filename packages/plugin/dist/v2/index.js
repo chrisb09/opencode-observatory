@@ -6484,14 +6484,14 @@ var v2_default = Plugin.define({
                 content: `OpenCode Observatory configuration removed.${args.clearData ? " Local outbox database also cleared." : ""} Telemetry is now stopped.`
               };
             }
-            if (!args.apiKey) {
+            if (!args.apiKey && !clientConfig) {
               return {
                 content: "Please provide your Observatory telemetry API key (starts with 'obs_') to connect, or pass clear: true to remove the current configuration."
               };
             }
             const result = await configureObservatory({
               url: args.url,
-              apiKey: args.apiKey,
+              apiKey: args.apiKey ?? clientConfig?.apiKey ?? "",
               autoImport: args.autoImport,
               contentMode: args.contentMode,
               summaryMode: args.summaryMode,
