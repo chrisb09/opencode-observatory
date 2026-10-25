@@ -8,6 +8,7 @@ import { inventory } from "../runtime.js";
 import { observeEvent } from "./events.js";
 import { accountData, createTransportHooks } from "./transport.js";
 import { getModelContext, setModelContext, wrapLanguageModel } from "./wrap.js";
+import { SUMMARY_MARKER, SummaryWorker, summarizeBatch } from "../summarize.js";
 
 const COLLECTOR = COLLECTOR_VERSION;
 
@@ -21,6 +22,16 @@ const setupInput = {
       type: "string",
       enum: ["off", "text", "full"],
       description: "Transcript capture: off (metadata only), text (prompts, responses, reasoning, media descriptors), or full (also capped tool input/output)",
+    },
+    summaryMode: {
+      type: "string",
+      enum: ["off", "manual", "live"],
+      description: "Session summarization: off, manual (observatory_summarize), or live on session completion",
+    },
+    summaryModels: {
+      type: "array",
+      items: { type: "string" },
+      description: "Ordered fallback models as provider/model#variant, e.g. antigravity/antigravity-gemini-3.8-flash#high",
     },
     clear: { type: "boolean", description: "Disconnect Observatory and remove local configuration" },
     clearData: { type: "boolean", description: "Also delete the local outbox database when clearing" },
@@ -49,6 +60,7 @@ export default Plugin.define({
     let clientConfig: ClientConfig | null = await loadConfig().catch(() => null);
     let collector: Collector | null = null;
     let outbox: Outbox | null = null;
+    let summaryWorker: SummaryWorker | null = null;
     let importTask: Promise<unknown> | undefined;
     let importStatus: unknown = "not started";
     const controller = new AbortController();
@@ -56,6 +68,7 @@ export default Plugin.define({
     const hydrated = new Map<string, Promise<boolean>>();
     const refreshed = new Map<string, number>();
     const sessionStatus = new Map<string, Metadata["status"]>();
+    const auxiliarySessions = new Set<string>();
     let runtime: Runtime = {
       opencode: ctx.app.version,
       opencodeSource: "executable",
@@ -126,10 +139,23 @@ export default Plugin.define({
           void recover();
         }
       }
+      if (outbox && typeof ctx.generate?.text === "function") {
+        const dependencies = {
+          config: next,
+          outbox,
+          directory: ctx.location.directory,
+          projectId: ctx.location.project.id,
+          generate: (input: { prompt: string; model: { providerID: string; id: string; variant?: string } }) => ctx.generate.text(input),
+          log,
+        };
+        if (!summaryWorker) summaryWorker = new SummaryWorker(dependencies);
+        else summaryWorker.updateConfig(next);
+      }
     };
 
     if (clientConfig) startTelemetry(clientConfig);
     else log("Not configured. Use the observatory_setup tool or run opencode-observatory setup.");
+    const enqueueSummary = (sessionID: string) => summaryWorker?.enqueue(sessionID);
 
     void (async () => {
       try {
@@ -140,6 +166,12 @@ export default Plugin.define({
           const sessionID = payload.sessionID ?? payload.info?.id;
           if (!sessionID) continue;
           if (value.location?.directory && value.location.directory !== ctx.location.directory) continue;
+          const promptText = payload.prompt?.text;
+          if (typeof promptText === "string" && promptText.includes(SUMMARY_MARKER)) {
+            auxiliarySessions.add(sessionID);
+            continue;
+          }
+          if (auxiliarySessions.has(sessionID)) continue;
           try {
             const type = String(value.type ?? "").replace(/^session\.next\./, "session.");
             const statuses: Record<string, Metadata["status"]> = {
@@ -151,6 +183,12 @@ export default Plugin.define({
             if (!await hydrate(sessionID, lifecycle)) continue;
             // Lifecycle payloads are partial; hydrate already emitted the full snapshot.
             if (!lifecycle) observeEvent(value, collector);
+            if (
+              clientConfig?.summaryMode === "live" &&
+              (type === "session.execution.succeeded" || type === "session.execution.failed" || type === "session.execution.interrupted" || type === "session.idle")
+            ) {
+              enqueueSummary(sessionID);
+            }
           } catch (error) {
             log(`Could not collect ${value.type}: ${String(error)}`);
           }
@@ -226,6 +264,8 @@ export default Plugin.define({
             url?: string;
             autoImport?: boolean;
             contentMode?: "off" | "text" | "full";
+            summaryMode?: "off" | "manual" | "live";
+            summaryModels?: string[];
             clear?: boolean;
             clearData?: boolean;
           };
@@ -255,6 +295,8 @@ export default Plugin.define({
               apiKey: args.apiKey,
               autoImport: args.autoImport,
               contentMode: args.contentMode,
+              summaryMode: args.summaryMode,
+              summaryModels: args.summaryModels,
             });
             startTelemetry(result.config);
             return { content: result.message };
@@ -271,7 +313,14 @@ export default Plugin.define({
         options: { codemode: false },
         execute: async () => ({
           content: outbox
-            ? JSON.stringify({ url: clientConfig?.url, installationId: clientConfig?.installationId, ...outbox.health(), history: importStatus })
+            ? JSON.stringify({
+                url: clientConfig?.url,
+                installationId: clientConfig?.installationId,
+                ...outbox.health(),
+                summaries: outbox.summaryCounts(),
+                summaryMode: clientConfig?.summaryMode,
+                history: importStatus,
+              })
             : "OpenCode Observatory is not configured yet. Run the 'observatory_setup' tool with your Observatory server URL and API key.",
         }),
       });
@@ -284,6 +333,50 @@ export default Plugin.define({
         execute: async () => {
           await recover();
           return { content: JSON.stringify({ history: importStatus, ...outbox?.health() }) };
+        },
+      });
+
+      editor.add({
+        name: "observatory_summarize",
+        description:
+          "Generate message and session summaries plus knowledge-vault claims from local V2 sessions. Uses the configured summary model fallback chain. Only root sessions promote claims.",
+        input: {
+          type: "object",
+          properties: {
+            limit: { type: "number", description: "Maximum sessions to consider (default 3, max 50)" },
+            sessionId: { type: "string", description: "Summarize one specific session id" },
+            force: { type: "boolean", description: "Regenerate even if a completed summary exists" },
+          },
+          additionalProperties: false,
+        },
+        options: { codemode: false },
+        execute: async (input: any) => {
+          if (!outbox || !clientConfig) {
+            return { content: "OpenCode Observatory is not configured yet. Run observatory_setup first." };
+          }
+          if (typeof ctx.generate?.text !== "function") {
+            return { content: "Session summarization requires the OpenCode V2 generate API." };
+          }
+          try {
+            const result = await summarizeBatch(
+              {
+                config: clientConfig,
+                outbox,
+                directory: ctx.location.directory,
+                projectId: ctx.location.project.id,
+                generate: value => ctx.generate.text(value),
+                log,
+              },
+              {
+                limit: typeof input?.limit === "number" ? input.limit : 3,
+                sessionId: typeof input?.sessionId === "string" ? input.sessionId : undefined,
+                force: input?.force === true,
+              },
+            );
+            return { content: JSON.stringify(result) };
+          } catch (error) {
+            return { content: `Summarization failed: ${(error as Error).message}` };
+          }
         },
       });
 
@@ -312,6 +405,7 @@ export default Plugin.define({
 
     return async () => {
       controller.abort();
+      summaryWorker?.close();
       await Promise.allSettled(hydrated.values());
       transport.clear();
       if (importTask) await importTask;

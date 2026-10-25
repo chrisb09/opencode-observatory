@@ -20,6 +20,8 @@ const ConfigSchema=z.object({
   url:z.string().url(),apiKey:z.string().min(10),fingerprintSecret:z.string().min(20),userId:z.string().uuid(),installationId:z.string().uuid(),
   machine:z.string().min(1).max(256),autoImport:z.boolean().default(false),enableTools:z.boolean().default(true),
   contentMode:z.enum(["off","text","full"]).default("off"),
+  summaryMode:z.enum(["off","manual","live"]).default("off"),
+  summaryModels:z.array(z.string().min(3).max(200)).max(5).default(["antigravity/antigravity-gemini-3.8-flash#high","opencode-go/deepseek-v4.1-flash#max"]),
   accounts:z.record(z.string()).default({}),historyDatabase:z.string().optional(),
 }).strict();
 export type ClientConfig=z.infer<typeof ConfigSchema>;
@@ -45,6 +47,8 @@ export async function configureObservatory(options: {
   autoImport?: boolean;
   enableTools?: boolean;
   contentMode?: "off" | "text" | "full";
+  summaryMode?: "off" | "manual" | "live";
+  summaryModels?: string[];
   fetcher?: typeof fetch;
 }): Promise<{
   config: ClientConfig;
@@ -96,6 +100,8 @@ export async function configureObservatory(options: {
     autoImport: options.autoImport ?? existing?.autoImport ?? true,
     enableTools,
     contentMode: options.contentMode ?? existing?.contentMode ?? "off",
+    summaryMode: options.summaryMode ?? existing?.summaryMode ?? "off",
+    summaryModels: options.summaryModels ?? existing?.summaryModels ?? ["antigravity/antigravity-gemini-3.8-flash#high","opencode-go/deepseek-v4.1-flash#max"],
     ...(existing?.historyDatabase ? { historyDatabase: existing.historyDatabase } : {}),
   };
 
@@ -110,6 +116,7 @@ export async function configureObservatory(options: {
     `• Query tools: ${enableTools ? "Enabled" : "Disabled (requires API key with read scope)"}`,
     `• Past sessions auto-import: ${config.autoImport ? "Enabled" : "Disabled"}`,
     `• Transcript capture: ${config.contentMode === "off" ? "Disabled (metadata only)" : config.contentMode === "text" ? "Text only (no tool I/O)" : "Full (capped tool I/O)"}`,
+    `• Session summaries: ${config.summaryMode === "off" ? "Disabled" : config.summaryMode === "manual" ? "Manual (observatory_summarize)" : "Live on session completion"}`,
   ].join("\n");
 
   return { config, hasReadScope, message };

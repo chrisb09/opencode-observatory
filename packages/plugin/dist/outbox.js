@@ -26,6 +26,7 @@ export class Outbox {
       CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(acknowledged_at,created_at);
       CREATE TABLE IF NOT EXISTS content(id TEXT PRIMARY KEY,digest TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,acknowledged_at INTEGER);
       CREATE INDEX IF NOT EXISTS content_pending ON content(acknowledged_at,created_at);
+      CREATE TABLE IF NOT EXISTS summary_state(session_id TEXT PRIMARY KEY,revision INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL,error TEXT);
       CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY,updated_at INTEGER NOT NULL,session_id TEXT NOT NULL);
     `);
     }
@@ -152,6 +153,20 @@ export class Outbox {
     replay() { this.db.query("UPDATE outbox SET acknowledged_at=NULL").run(); this.db.query("UPDATE content SET acknowledged_at=NULL").run(); }
     cursor(source) { return this.db.query("SELECT updated_at,session_id FROM cursors WHERE source=?").get(source); }
     checkpoint(source, updatedAt, sessionId) { this.db.query("INSERT INTO cursors VALUES(?,?,?) ON CONFLICT(source) DO UPDATE SET updated_at=excluded.updated_at,session_id=excluded.session_id").run(source, updatedAt, sessionId); }
+    summaryState(sessionId) { return this.db.query("SELECT revision,status,attempts,error,updated_at FROM summary_state WHERE session_id=?").get(sessionId); }
+    setSummaryState(sessionId, revision, status, error = null) {
+        this.db.query(`INSERT INTO summary_state(session_id,revision,status,attempts,updated_at,error) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,updated_at=excluded.updated_at,error=excluded.error,
+        attempts=CASE WHEN excluded.status='failed' THEN summary_state.attempts+1 WHEN excluded.status='done' THEN 0 ELSE summary_state.attempts END`)
+            .run(sessionId, revision, status, status === "failed" ? 1 : 0, Date.now(), error);
+    }
+    summaryCounts() {
+        const rows = this.db.query("SELECT status,count(*) AS n FROM summary_state GROUP BY status").all();
+        const counts = { done: 0, pending: 0, running: 0, failed: 0 };
+        for (const row of rows)
+            counts[row.status] = row.n;
+        return counts;
+    }
     async close() { this.stopped = true; if (this.timer)
         clearTimeout(this.timer); try {
         await this.inflight;

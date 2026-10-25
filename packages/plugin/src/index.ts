@@ -49,6 +49,8 @@ const plugin:Plugin=async ctx=>{
         url:tool.schema.string().optional().describe("Observatory server URL (defaults to http://localhost:7692)"),
         autoImport:tool.schema.boolean().optional().describe("Whether to import past sessions automatically (default: true)"),
         contentMode:tool.schema.enum(["off","text","full"]).optional().describe("Transcript capture: off (metadata only), text (prompts, responses, reasoning, media descriptors), or full (also capped tool input/output)"),
+        summaryMode:tool.schema.enum(["off","manual","live"]).optional().describe("Session summarization: off, manual, or live (V2 plugin)"),
+        summaryModels:tool.schema.array(tool.schema.string()).optional().describe("Ordered fallback models as provider/model#variant"),
         clear:tool.schema.boolean().optional().describe("Set to true to disconnect Observatory and delete the local configuration"),
         clearData:tool.schema.boolean().optional().describe("When clear is true, also delete the local SQLite outbox database"),
       },
@@ -63,7 +65,7 @@ const plugin:Plugin=async ctx=>{
           if(!args.apiKey){
             return "Please provide your Observatory telemetry API key (starts with 'obs_') to connect, or pass clear: true to remove the current configuration.";
           }
-          const result=await configureObservatory({url:args.url,apiKey:args.apiKey,autoImport:args.autoImport,contentMode:args.contentMode,fetcher:registry.original});
+          const result=await configureObservatory({url:args.url,apiKey:args.apiKey,autoImport:args.autoImport,contentMode:args.contentMode,summaryMode:args.summaryMode,summaryModels:args.summaryModels,fetcher:registry.original});
           startTelemetry(result.config);
           return result.message;
         }catch(error){

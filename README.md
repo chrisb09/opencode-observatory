@@ -155,6 +155,8 @@ bun x github:chrisb09/opencode-observatory clear --all
 When configured with a read-capable key, the plugin exposes tools directly in OpenCode:
 - `observatory_status`: Check local outbox delivery health and pending queue counts.
 - `observatory_usage`: Query centralized usage, model breakdowns, and token statistics across any timeframe.
+- `observatory_summarize` (V2): Generate message/session summaries and vault claims from local sessions using the configured model fallback chain.
+- `observatory_import` (V2): Recover missing V2 session metadata and transcripts from local history.
 - `observatory_setup`: Connect, update, or disconnect (with `clear: true`) your Observatory connection on the fly. Accepts `contentMode: "off" | "text" | "full"` to opt into transcript capture.
 
 ### Model Context Protocol (MCP) Server
@@ -195,6 +197,25 @@ Transcript capture is disabled by default. Enable it through `observatory_setup`
 - **Cross-machine recall:** `search_sessions` searches scrubbed transcripts from every machine; `session_transcript` pages through parts and `session_summaries` returns model digests.
 - **Vault:** extracted claims carry a stable subject, scope (`global`, `project:<id>`, or `machine:<host>`), evidence tier, source validity time, and provenance down to session/message/part. The server folds them bitemporally, so an older session imported later from another machine cannot overwrite newer truth. Conflicting claims remain visible as `disputed` instead of being silently resolved.
 - **Git history:** one repository per tenant under `vaultdata`, rendered as Markdown concept notes with curated-prose regions. Commits carry `X-Observatory-Installation`, `-Machine`, `-Root-Session`, `-Evidence-Session`, `-Messages`, `-Agent`, `-Model`, and `-Prompt-Version` trailers for `git log`/`git blame` style provenance.
+
+### Model Summaries
+
+Summaries are opt-in via `summaryMode`:
+
+| Mode | Behavior |
+| :--- | :--- |
+| `off` | No summarization (default) |
+| `manual` | Use the V2 `observatory_summarize` tool |
+| `live` | Summarize a session when it completes or goes idle |
+
+`summaryModels` is an ordered fallback list. The default is:
+
+```text
+antigravity/antigravity-gemini-3.8-flash#high
+opencode-go/deepseek-v4.1-flash#max
+```
+
+For each session the V2 worker reads the local `session_v2`/`session_message` projections, redacts credentials, builds a bounded transcript prompt, and asks the model for one JSON object containing message digests, a session summary, and candidate claims. It validates the response, posts summaries to `/api/summaries`, and posts claims to `/api/vault/claims` only for **root sessions**; subagent child sessions receive summaries but never promote claims. Model output and prompts are secret-scrubbed before either leaves the process. Failed generations fall back to the next model and are recorded in the local `summary_state` table with retry limits.
 
 ---
 

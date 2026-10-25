@@ -15,6 +15,8 @@ declare const ConfigSchema: z.ZodObject<{
     autoImport: z.ZodDefault<z.ZodBoolean>;
     enableTools: z.ZodDefault<z.ZodBoolean>;
     contentMode: z.ZodDefault<z.ZodEnum<["off", "text", "full"]>>;
+    summaryMode: z.ZodDefault<z.ZodEnum<["off", "manual", "live"]>>;
+    summaryModels: z.ZodDefault<z.ZodArray<z.ZodString, "many">>;
     accounts: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodString>>;
     historyDatabase: z.ZodOptional<z.ZodString>;
 }, "strict", z.ZodTypeAny, {
@@ -27,6 +29,8 @@ declare const ConfigSchema: z.ZodObject<{
     autoImport: boolean;
     enableTools: boolean;
     contentMode: "off" | "text" | "full";
+    summaryMode: "off" | "manual" | "live";
+    summaryModels: string[];
     accounts: Record<string, string>;
     schemaVersion?: number | undefined;
     historyDatabase?: string | undefined;
@@ -41,6 +45,8 @@ declare const ConfigSchema: z.ZodObject<{
     autoImport?: boolean | undefined;
     enableTools?: boolean | undefined;
     contentMode?: "off" | "text" | "full" | undefined;
+    summaryMode?: "off" | "manual" | "live" | undefined;
+    summaryModels?: string[] | undefined;
     accounts?: Record<string, string> | undefined;
     historyDatabase?: string | undefined;
 }>;
@@ -59,6 +65,8 @@ export declare function configureObservatory(options: {
     autoImport?: boolean;
     enableTools?: boolean;
     contentMode?: "off" | "text" | "full";
+    summaryMode?: "off" | "manual" | "live";
+    summaryModels?: string[];
     fetcher?: typeof fetch;
 }): Promise<{
     config: ClientConfig;

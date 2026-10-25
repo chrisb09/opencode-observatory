@@ -4080,6 +4080,8 @@ var ConfigSchema = external_exports.object({
   autoImport: external_exports.boolean().default(false),
   enableTools: external_exports.boolean().default(true),
   contentMode: external_exports.enum(["off", "text", "full"]).default("off"),
+  summaryMode: external_exports.enum(["off", "manual", "live"]).default("off"),
+  summaryModels: external_exports.array(external_exports.string().min(3).max(200)).max(5).default(["antigravity/antigravity-gemini-3.8-flash#high", "opencode-go/deepseek-v4.1-flash#max"]),
   accounts: external_exports.record(external_exports.string()).default({}),
   historyDatabase: external_exports.string().optional()
 }).strict();
@@ -4150,6 +4152,8 @@ async function configureObservatory(options) {
     autoImport: options.autoImport ?? existing?.autoImport ?? true,
     enableTools,
     contentMode: options.contentMode ?? existing?.contentMode ?? "off",
+    summaryMode: options.summaryMode ?? existing?.summaryMode ?? "off",
+    summaryModels: options.summaryModels ?? existing?.summaryModels ?? ["antigravity/antigravity-gemini-3.8-flash#high", "opencode-go/deepseek-v4.1-flash#max"],
     ...existing?.historyDatabase ? { historyDatabase: existing.historyDatabase } : {}
   };
   await saveConfig(config);
@@ -4161,7 +4165,8 @@ async function configureObservatory(options) {
     `\u2022 Ingestion: Active`,
     `\u2022 Query tools: ${enableTools ? "Enabled" : "Disabled (requires API key with read scope)"}`,
     `\u2022 Past sessions auto-import: ${config.autoImport ? "Enabled" : "Disabled"}`,
-    `\u2022 Transcript capture: ${config.contentMode === "off" ? "Disabled (metadata only)" : config.contentMode === "text" ? "Text only (no tool I/O)" : "Full (capped tool I/O)"}`
+    `\u2022 Transcript capture: ${config.contentMode === "off" ? "Disabled (metadata only)" : config.contentMode === "text" ? "Text only (no tool I/O)" : "Full (capped tool I/O)"}`,
+    `\u2022 Session summaries: ${config.summaryMode === "off" ? "Disabled" : config.summaryMode === "manual" ? "Manual (observatory_summarize)" : "Live on session completion"}`
   ].join("\n");
   return { config, hasReadScope, message };
 }
@@ -4906,6 +4911,7 @@ var Outbox = class {
       CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(acknowledged_at,created_at);
       CREATE TABLE IF NOT EXISTS content(id TEXT PRIMARY KEY,digest TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,acknowledged_at INTEGER);
       CREATE INDEX IF NOT EXISTS content_pending ON content(acknowledged_at,created_at);
+      CREATE TABLE IF NOT EXISTS summary_state(session_id TEXT PRIMARY KEY,revision INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL,error TEXT);
       CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY,updated_at INTEGER NOT NULL,session_id TEXT NOT NULL);
     `);
   }
@@ -5037,6 +5043,20 @@ var Outbox = class {
   }
   checkpoint(source, updatedAt, sessionId) {
     this.db.query("INSERT INTO cursors VALUES(?,?,?) ON CONFLICT(source) DO UPDATE SET updated_at=excluded.updated_at,session_id=excluded.session_id").run(source, updatedAt, sessionId);
+  }
+  summaryState(sessionId) {
+    return this.db.query("SELECT revision,status,attempts,error,updated_at FROM summary_state WHERE session_id=?").get(sessionId);
+  }
+  setSummaryState(sessionId, revision, status, error = null) {
+    this.db.query(`INSERT INTO summary_state(session_id,revision,status,attempts,updated_at,error) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,updated_at=excluded.updated_at,error=excluded.error,
+        attempts=CASE WHEN excluded.status='failed' THEN summary_state.attempts+1 WHEN excluded.status='done' THEN 0 ELSE summary_state.attempts END`).run(sessionId, revision, status, status === "failed" ? 1 : 0, Date.now(), error);
+  }
+  summaryCounts() {
+    const rows = this.db.query("SELECT status,count(*) AS n FROM summary_state GROUP BY status").all();
+    const counts = { done: 0, pending: 0, running: 0, failed: 0 };
+    for (const row of rows) counts[row.status] = row.n;
+    return counts;
   }
   async close() {
     this.stopped = true;
@@ -5525,6 +5545,8 @@ var plugin = async (ctx) => {
         url: tool.schema.string().optional().describe("Observatory server URL (defaults to http://localhost:7692)"),
         autoImport: tool.schema.boolean().optional().describe("Whether to import past sessions automatically (default: true)"),
         contentMode: tool.schema.enum(["off", "text", "full"]).optional().describe("Transcript capture: off (metadata only), text (prompts, responses, reasoning, media descriptors), or full (also capped tool input/output)"),
+        summaryMode: tool.schema.enum(["off", "manual", "live"]).optional().describe("Session summarization: off, manual, or live (V2 plugin)"),
+        summaryModels: tool.schema.array(tool.schema.string()).optional().describe("Ordered fallback models as provider/model#variant"),
         clear: tool.schema.boolean().optional().describe("Set to true to disconnect Observatory and delete the local configuration"),
         clearData: tool.schema.boolean().optional().describe("When clear is true, also delete the local SQLite outbox database")
       },
@@ -5546,7 +5568,7 @@ var plugin = async (ctx) => {
           if (!args.apiKey) {
             return "Please provide your Observatory telemetry API key (starts with 'obs_') to connect, or pass clear: true to remove the current configuration.";
           }
-          const result = await configureObservatory({ url: args.url, apiKey: args.apiKey, autoImport: args.autoImport, contentMode: args.contentMode, fetcher: registry.original });
+          const result = await configureObservatory({ url: args.url, apiKey: args.apiKey, autoImport: args.autoImport, contentMode: args.contentMode, summaryMode: args.summaryMode, summaryModels: args.summaryModels, fetcher: registry.original });
           startTelemetry(result.config);
           return result.message;
         } catch (error) {

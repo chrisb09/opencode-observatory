@@ -39,5 +39,14 @@ export declare class Outbox {
         session_id: string;
     } | null;
     checkpoint(source: string, updatedAt: number, sessionId: string): void;
+    summaryState(sessionId: string): {
+        revision: number;
+        status: string;
+        attempts: number;
+        error: string | null;
+        updated_at: number;
+    } | null;
+    setSummaryState(sessionId: string, revision: number, status: "pending" | "running" | "done" | "failed", error?: string | null): void;
+    summaryCounts(): Record<string, number>;
     close(): Promise<void>;
 }

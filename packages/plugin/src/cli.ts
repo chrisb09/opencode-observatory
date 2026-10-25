@@ -23,7 +23,11 @@ try{
       const enableTools=(await rl.question("Enable in-OpenCode statistics tools? [Y/n]: ")).toLowerCase()!=="n";
       const contentAnswer=(await rl.question("Capture transcript text? [off/text/full] (default off): ")).trim().toLowerCase();
       const contentMode=contentAnswer==="text"||contentAnswer==="full"?contentAnswer:"off";
-      const result=await configureObservatory({url:rawUrl,apiKey,autoImport,enableTools,contentMode});
+      const summaryAnswer=(await rl.question("Generate session summaries? [off/manual/live] (default off): ")).trim().toLowerCase();
+      const summaryMode=summaryAnswer==="manual"||summaryAnswer==="live"?summaryAnswer:"off";
+      const modelsAnswer=(await rl.question("Summary models [antigravity/antigravity-gemini-3.8-flash#high, opencode-go/deepseek-v4.1-flash#max]: ")).trim();
+      const summaryModels=modelsAnswer?modelsAnswer.split(",").map(value=>value.trim()).filter(Boolean):undefined;
+      const result=await configureObservatory({url:rawUrl,apiKey,autoImport,enableTools,contentMode,summaryMode,summaryModels});
       console.log(result.message);
       console.log("Add the plugin to OpenCode, then quit and restart OpenCode. Run 'opencode-observatory import' to import history now.");
     }finally{rl.close();}
@@ -41,7 +45,7 @@ try{
         try{console.log(JSON.stringify(await outbox.drain(),null,2));}catch(err){console.error(`Upload paused: ${outbox.lastError??(err instanceof Error?err.message:String(err))}. Imported metadata remains queued; run flush later or start OpenCode.`);}
       }else if(command==="flush"){try{console.log(JSON.stringify(await outbox.drain(),null,2));}catch(err){console.error(`Flush paused: ${outbox.lastError??(err instanceof Error?err.message:String(err))}`);}}
       else if(command==="replay"){outbox.replay();console.log("All retained metadata and transcript content is pending again. Run flush to replay it.");}
-      else if(command==="status")console.log(JSON.stringify({url:config.url,installationId:config.installationId,...outbox.health()},null,2));
+      else if(command==="status")console.log(JSON.stringify({url:config.url,installationId:config.installationId,summaryMode:config.summaryMode,...outbox.health(),summaries:outbox.summaryCounts()},null,2));
       else if(command==="mcp-config")console.log(JSON.stringify({$schema:"https://opencode.ai/config.json",mcp:{servers:{observatory:{type:"remote",url:`${config.url.replace(/\/$/,"")}/mcp`,oauth:false,headers:{Authorization:"Bearer {env:OBSERVATORY_API_KEY}"}}}}},null,2));
       else throw new Error("Commands: setup, clear [--all], status, import [--all] [--database PATH], flush, replay, mcp-config");
     }finally{await outbox.close();}

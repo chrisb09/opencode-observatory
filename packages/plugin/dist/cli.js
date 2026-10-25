@@ -4082,6 +4082,8 @@ var ConfigSchema = external_exports.object({
   autoImport: external_exports.boolean().default(false),
   enableTools: external_exports.boolean().default(true),
   contentMode: external_exports.enum(["off", "text", "full"]).default("off"),
+  summaryMode: external_exports.enum(["off", "manual", "live"]).default("off"),
+  summaryModels: external_exports.array(external_exports.string().min(3).max(200)).max(5).default(["antigravity/antigravity-gemini-3.8-flash#high", "opencode-go/deepseek-v4.1-flash#max"]),
   accounts: external_exports.record(external_exports.string()).default({}),
   historyDatabase: external_exports.string().optional()
 }).strict();
@@ -4152,6 +4154,8 @@ async function configureObservatory(options) {
     autoImport: options.autoImport ?? existing?.autoImport ?? true,
     enableTools,
     contentMode: options.contentMode ?? existing?.contentMode ?? "off",
+    summaryMode: options.summaryMode ?? existing?.summaryMode ?? "off",
+    summaryModels: options.summaryModels ?? existing?.summaryModels ?? ["antigravity/antigravity-gemini-3.8-flash#high", "opencode-go/deepseek-v4.1-flash#max"],
     ...existing?.historyDatabase ? { historyDatabase: existing.historyDatabase } : {}
   };
   await saveConfig(config);
@@ -4163,7 +4167,8 @@ async function configureObservatory(options) {
     `\u2022 Ingestion: Active`,
     `\u2022 Query tools: ${enableTools ? "Enabled" : "Disabled (requires API key with read scope)"}`,
     `\u2022 Past sessions auto-import: ${config.autoImport ? "Enabled" : "Disabled"}`,
-    `\u2022 Transcript capture: ${config.contentMode === "off" ? "Disabled (metadata only)" : config.contentMode === "text" ? "Text only (no tool I/O)" : "Full (capped tool I/O)"}`
+    `\u2022 Transcript capture: ${config.contentMode === "off" ? "Disabled (metadata only)" : config.contentMode === "text" ? "Text only (no tool I/O)" : "Full (capped tool I/O)"}`,
+    `\u2022 Session summaries: ${config.summaryMode === "off" ? "Disabled" : config.summaryMode === "manual" ? "Manual (observatory_summarize)" : "Live on session completion"}`
   ].join("\n");
   return { config, hasReadScope, message };
 }
@@ -4392,6 +4397,7 @@ var Outbox = class {
       CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(acknowledged_at,created_at);
       CREATE TABLE IF NOT EXISTS content(id TEXT PRIMARY KEY,digest TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,acknowledged_at INTEGER);
       CREATE INDEX IF NOT EXISTS content_pending ON content(acknowledged_at,created_at);
+      CREATE TABLE IF NOT EXISTS summary_state(session_id TEXT PRIMARY KEY,revision INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL,error TEXT);
       CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY,updated_at INTEGER NOT NULL,session_id TEXT NOT NULL);
     `);
   }
@@ -4523,6 +4529,20 @@ var Outbox = class {
   }
   checkpoint(source, updatedAt, sessionId) {
     this.db.query("INSERT INTO cursors VALUES(?,?,?) ON CONFLICT(source) DO UPDATE SET updated_at=excluded.updated_at,session_id=excluded.session_id").run(source, updatedAt, sessionId);
+  }
+  summaryState(sessionId) {
+    return this.db.query("SELECT revision,status,attempts,error,updated_at FROM summary_state WHERE session_id=?").get(sessionId);
+  }
+  setSummaryState(sessionId, revision, status, error = null) {
+    this.db.query(`INSERT INTO summary_state(session_id,revision,status,attempts,updated_at,error) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,updated_at=excluded.updated_at,error=excluded.error,
+        attempts=CASE WHEN excluded.status='failed' THEN summary_state.attempts+1 WHEN excluded.status='done' THEN 0 ELSE summary_state.attempts END`).run(sessionId, revision, status, status === "failed" ? 1 : 0, Date.now(), error);
+  }
+  summaryCounts() {
+    const rows = this.db.query("SELECT status,count(*) AS n FROM summary_state GROUP BY status").all();
+    const counts = { done: 0, pending: 0, running: 0, failed: 0 };
+    for (const row of rows) counts[row.status] = row.n;
+    return counts;
   }
   async close() {
     this.stopped = true;
@@ -5165,7 +5185,11 @@ try {
       const enableTools = (await rl.question("Enable in-OpenCode statistics tools? [Y/n]: ")).toLowerCase() !== "n";
       const contentAnswer = (await rl.question("Capture transcript text? [off/text/full] (default off): ")).trim().toLowerCase();
       const contentMode = contentAnswer === "text" || contentAnswer === "full" ? contentAnswer : "off";
-      const result = await configureObservatory({ url: rawUrl, apiKey, autoImport, enableTools, contentMode });
+      const summaryAnswer = (await rl.question("Generate session summaries? [off/manual/live] (default off): ")).trim().toLowerCase();
+      const summaryMode = summaryAnswer === "manual" || summaryAnswer === "live" ? summaryAnswer : "off";
+      const modelsAnswer = (await rl.question("Summary models [antigravity/antigravity-gemini-3.8-flash#high, opencode-go/deepseek-v4.1-flash#max]: ")).trim();
+      const summaryModels = modelsAnswer ? modelsAnswer.split(",").map((value) => value.trim()).filter(Boolean) : void 0;
+      const result = await configureObservatory({ url: rawUrl, apiKey, autoImport, enableTools, contentMode, summaryMode, summaryModels });
       console.log(result.message);
       console.log("Add the plugin to OpenCode, then quit and restart OpenCode. Run 'opencode-observatory import' to import history now.");
     } finally {
@@ -5199,7 +5223,7 @@ try {
       } else if (command === "replay") {
         outbox.replay();
         console.log("All retained metadata and transcript content is pending again. Run flush to replay it.");
-      } else if (command === "status") console.log(JSON.stringify({ url: config.url, installationId: config.installationId, ...outbox.health() }, null, 2));
+      } else if (command === "status") console.log(JSON.stringify({ url: config.url, installationId: config.installationId, summaryMode: config.summaryMode, ...outbox.health(), summaries: outbox.summaryCounts() }, null, 2));
       else if (command === "mcp-config") console.log(JSON.stringify({ $schema: "https://opencode.ai/config.json", mcp: { servers: { observatory: { type: "remote", url: `${config.url.replace(/\/$/, "")}/mcp`, oauth: false, headers: { Authorization: "Bearer {env:OBSERVATORY_API_KEY}" } } } } }, null, 2));
       else throw new Error("Commands: setup, clear [--all], status, import [--all] [--database PATH], flush, replay, mcp-config");
     } finally {
