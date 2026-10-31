@@ -29,6 +29,7 @@
     "test:integration": "bun --env-file=.env scripts/test-integration.ts",
     "test:opencode": "bun scripts/opencode-smoke.ts",
     "test:browser": "bun --env-file=.env scripts/browser-smoke.ts",
+    "audit:pricing": "node --env-file=.env --import tsx scripts/audit-pricing.ts",
     "benchmark:analytics": "node --env-file=.env --import tsx scripts/benchmark-analytics.ts",
     "dev": "node --watch --env-file=.env --import tsx apps/server/src/index.ts",
     "dev:web": "npm run dev -w @observatory/web",

@@ -266,6 +266,20 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     }finally{await pool.query("DELETE FROM market_rates WHERE model_pattern=$1",[model]);}
     expect(await cost()).toBeNull();
   });
+  test("current Kimi K3.1 Pro usage receives catalog market pricing",async()=>{
+    const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
+    const rates=(await pool.query("SELECT model_pattern,input::float8 AS input,output::float8 AS output,cache_read::float8 AS cache_read,cache_write::float8 AS cache_write FROM market_rates WHERE model_pattern IN ('kimi-k3.1-pro','kimi-k3.1-pro-highspeed') ORDER BY model_pattern")).rows;
+    expect(rates).toEqual([
+      {model_pattern:"kimi-k3.1-pro",input:2,output:10,cache_read:.2,cache_write:2},
+      {model_pattern:"kimi-k3.1-pro-highspeed",input:4,output:20,cache_read:.2,cache_write:4},
+    ]);
+    const sessionId=`ses_${randomUUID()}`,step=event({sessionId,data:{...event().data,provider:"opencode-go",model:"kimi-k3.1-pro",inputTokens:1_000_000,outputTokens:100_000,reasoningTokens:0,cacheReadTokens:200_000,cacheWriteTokens:100_000,cost:0,costSource:"opencode-estimate"}});
+    expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[step]}})).statusCode).toBe(200);
+    invalidateAnalytics(userA);
+    const summary=(await analytics(userA,{sessionId})).summary;
+    expect(summary.market_cost).toBeCloseTo(3.24,8);
+    expect(summary.unknown_market_calls).toBe(0);
+  });
   test("rollup dimension keys preserve escaped and Unicode metadata",async()=>{
     const machine='quoted " \\ newline\n café',sessionId=`ses_${randomUUID()}`;
     expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[event({machine,sessionId})]}})).statusCode).toBe(200);

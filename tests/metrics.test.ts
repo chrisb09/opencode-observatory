@@ -41,6 +41,13 @@ test("market matching rejects empty/unknown models and normalizes explicit Antig
   expect(resolveMarket("antigravity-gemini-3.8-flash-high", [rate])).toEqual(rate); expect(resolveMarket("unrelated-model", [rate])).toBeNull(); expect(resolveMarket("", [rate])).toBeNull(); expect(resolveMarket(null, [rate])).toBeNull();
   const muse = { ...rate, model_pattern: "muse-spark-1.3" };expect(resolveMarket("muse-spark-1.3-contributor-free", [muse])).toEqual(muse);
 });
+test("Kimi K3.1 Pro base and highspeed rates resolve as distinct models", () => {
+  const base = { model_pattern: "kimi-k3.1-pro", input: 2, output: 10, cache_read: .2, cache_write: 2 };
+  const highspeed = { model_pattern: "kimi-k3.1-pro-highspeed", input: 4, output: 20, cache_read: .2, cache_write: 4 };
+  expect(resolveMarket("opencode-go/kimi-k3.1-pro", [base, highspeed])).toEqual(base);
+  expect(resolveMarket("kimi-k3.1-pro-highspeed", [base, highspeed])).toEqual(highspeed);
+  expect(resolveMarket("kimi-k3.1-pro-highspeed", [base])).toBeNull();
+});
 test("model colors are stable across reordering and distinct for the displayed models", () => {
   const models = ["openai/gpt-5.5", "google/antigravity-gemini-3.8-flash", "oneprovider/claude-haiku-4-5", "google/antigravity-claude-sonnet-4-6", "opencode-go/glm-5.3", "openai/gpt-6.1-sol", "zai/glm-5.3", "opencode-go/kimi-k3"];
   const colors = models.map(modelColor); expect(new Set(colors).size).toBe(models.length); expect([...models].reverse().map(modelColor).reverse()).toEqual(colors);
