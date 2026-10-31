@@ -1,6 +1,6 @@
 {
   "name": "opencode-observatory-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Durable metadata-only OpenCode usage telemetry and history import",
   "type": "module",
   "main": "./dist/index.js",
@@ -30,7 +30,7 @@
     "@opencode/plugin": "^2.1.3"
   },
   "devDependencies": {
-    "@observatory/contracts": "0.1.0",
+    "@observatory/contracts": "0.2.0",
     "esbuild": "^0.25.0"
   }
 }
