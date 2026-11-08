@@ -1,5 +1,6 @@
 import type { PoolClient } from "pg";
 import type { Filters } from "@observatory/contracts";
+import { tenant } from "./db.js";
 import { usageSQL, lookups, records } from "./usage.js";
 import { usageVector, type UsageBucket, type UsageDimensions } from "./metrics.js";
 
@@ -7,21 +8,51 @@ const hour=3600000;
 export async function lockUsage(db:PoolClient,userId:string) {
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended('observatory:usage:'||$1,0))",[userId]);
 }
-// The source triggers track identities and their deduplication dependants. Refresh
-// canonical facts in the same ingest transaction; fact triggers maintain buckets.
-export async function refreshUsage(db:PoolClient,userId:string,force=false) {
-  const status=async()=> (await db.query(`SELECT s.ready,(s.catalog_revision=v.revision AND s.format_version=2) AS current,v.revision AS catalog_version,
+export async function usageState(db:PoolClient,userId:string) {
+  return (await db.query(`SELECT s.ready,(s.catalog_revision=v.revision AND s.format_version=2) AS current,v.revision AS catalog_version,
     EXISTS(SELECT 1 FROM usage_dirty WHERE user_id=$1) AS dirty
     FROM usage_catalog_version v LEFT JOIN usage_rollup_state s ON s.user_id=$1`,[userId])).rows[0];
-  let state=await status();
+}
+// A warranted full rebuild rewrites every fact and bucket for a tenant and can
+// run for a minute or more. It must not run inside a request transaction: a
+// proxy timeout rolls the work back and re-arms it on the next request. The
+// persisted state (ready flag, catalog revision) is the queue, so background
+// rebuilds only need to be poked; a single-flight promise merges concurrent pokes.
+const rebuilds=new Map<string,Promise<void>>();
+export function rebuildUsage(userId:string):Promise<void> {
+  const running=rebuilds.get(userId);
+  if(running)return running;
+  const started=performance.now();
+  console.log(JSON.stringify({level:30,msg:"usage rebuild starting",userId}));
+  const run=(async()=>{try{
+    await tenant(userId,db=>refreshUsage(db,userId));
+    console.log(JSON.stringify({level:30,msg:"usage rebuild completed",userId,ms:Math.round(performance.now()-started)}));
+  }catch(error){
+    console.error(JSON.stringify({level:50,msg:"usage rebuild failed",userId,error:error instanceof Error?error.message:String(error)}));
+    throw error;
+  }finally{rebuilds.delete(userId);}})();
+  rebuilds.set(userId,run);
+  return run;
+}
+export function scheduleRebuild(userId:string):void {
+  rebuildUsage(userId).catch(()=>{});
+}
+// The source triggers track identities and their deduplication dependants. Refresh
+// canonical facts in the same ingest transaction; fact triggers maintain buckets.
+// deferFull keeps the bounded dirty-key refresh in the request path and defers a
+// warranted full rebuild (rule or catalog change) to the background worker.
+export async function refreshUsage(db:PoolClient,userId:string,force=false,deferFull=false):Promise<{deferred?:boolean}|undefined> {
+  let state=await usageState(db,userId);
   if(!force&&state.ready&&state.current&&!state.dirty)return;
   await db.query("SET LOCAL jit=off");
   await lockUsage(db,userId);
   await db.query("INSERT INTO usage_rollup_state(user_id) VALUES($1) ON CONFLICT DO NOTHING",[userId]);
   await db.query("SELECT user_id FROM usage_rollup_state WHERE user_id=$1 FOR UPDATE",[userId]);
-  state=await status();
+  state=await usageState(db,userId);
   if(!force&&state.ready&&state.current&&!state.dirty)return;
-  const full=force||!state.ready||!state.current;
+  const warranted=force||!state.ready||!state.current;
+  const deferred=!force&&deferFull&&warranted;
+  const full=warranted&&!deferred;
   const keys=(await db.query("DELETE FROM usage_dirty WHERE user_id=$1 RETURNING installation_id,kind,entity_id",[userId])).rows;
   const keySQL=`EXISTS(SELECT 1 FROM jsonb_to_recordset($2::jsonb) p(installation_id uuid,kind text,entity_id text)
     WHERE p.installation_id=e.installation_id AND p.kind=e.kind AND p.entity_id=e.entity_id)`;
@@ -53,6 +84,9 @@ export async function refreshUsage(db:PoolClient,userId:string,force=false) {
       SELECT $1,p.* FROM jsonb_to_recordset($2::jsonb) p(installation_id uuid,kind text,entity_id text,session_id text,observed_at bigint,dimensions jsonb,metrics numeric[],duration double precision,output double precision)
       ORDER BY installation_id,kind,entity_id`,[userId,JSON.stringify(batch)]);
   }
+  // A deferred refresh only carried the bounded dirty-key pass; the warranted
+  // full rebuild stays pending so the background worker still runs it.
+  if(deferred)return{deferred:true};
   await db.query(`INSERT INTO usage_rollup_state(user_id,ready,catalog_revision,format_version,updated_at)
     VALUES($1,true,$2,2,now())
     ON CONFLICT(user_id) DO UPDATE SET ready=true,catalog_revision=EXCLUDED.catalog_revision,format_version=2,updated_at=now()`,[userId,state.catalog_version]);
@@ -72,8 +106,19 @@ function dimensionFilter(f:Filters,values:unknown[]) {
 }
 export async function usageBuckets(db:PoolClient,userId:string,f:Filters):Promise<{buckets:UsageBucket[];earliest:number|null}> {
   // Keep complete buckets and boundary facts on the same canonical generation.
+  // A warranted full rebuild runs on the background worker while this
+  // transaction holds no advisory lock; reads join it instead of deadlocking.
+  for(let attempt=0;attempt<3;attempt++) {
+    const state=await usageState(db,userId);
+    if(state.ready&&state.current)break;
+    await rebuildUsage(userId);
+  }
   await lockUsage(db,userId);
-  await refreshUsage(db,userId);
+  if((await refreshUsage(db,userId,false,true))?.deferred) {
+    // A rule or catalog change raced the pre-check and this lock; carry the
+    // rebuild inline so this read never serves a stale generation.
+    await refreshUsage(db,userId);
+  }
   const values:unknown[]=[userId],scope=dimensionFilter(f,values);
   const bind=(value:unknown)=>{values.push(value);return `$${values.length}`;};
   let exact="";

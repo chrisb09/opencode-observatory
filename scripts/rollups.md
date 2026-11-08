@@ -61,6 +61,31 @@ Market-catalog changes increment a global generation. An out-of-date generation 
 rebuilt on the next usage refresh. Format version 1 is also checked; normalization
 changes require a version bump or an explicit rebuild.
 
+### Bounded refreshes and full rebuilds
+
+The two refresh scales are deliberately kept on different execution paths:
+
+- **Bounded dirty-key refresh** — runs inside the ingest/read transaction, is
+  typically milliseconds, and keeps facts real-time. This is the common case.
+- **Full rebuild** — warranted when the readiness flag drops (alias/price/account
+  rule changes) or the catalog/format generation moves. It rewrites every fact
+  and bucket for the tenant and can run for a minute or more on production-sized
+  data. It never runs inside a request: a proxy timeout would roll the work back
+  and re-arm it on the next request, turning one expensive operation into a
+  discard-and-retry storm that also keeps the write-ahead log it already
+  produced. Instead, ingest and reads carry only the bounded refresh
+  (`refreshUsage(..., deferFull=true)`), and a single-flight background worker
+  (`rebuildUsage`) performs the full pass on its own connection. The persisted
+  state itself is the queue — the worker only needs to be poked — so a crashed
+  worker is retried by the next request that notices the stale generation.
+- Reads gate on the generation: `usageBuckets` joins a pending background
+  rebuild *before* taking the per-user advisory lock (awaiting it while holding
+  the lock would deadlock) and never serves a mixed generation. A rule or
+  catalog change that races the pre-check falls back to an inline rebuild, the
+  former behavior, so correctness is never traded for latency.
+- The explicit maintenance command below still performs full rebuilds inline
+  and is the preferred way to rebuild out-of-band after a catalog deploy.
+
 With `DATABASE_URL` configured for the application role:
 
 ```sh

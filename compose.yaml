@@ -1,6 +1,9 @@
 services:
   db:
     image: postgres:17-alpine
+    # Absorb write bursts (full usage rebuilds, outbox replays) without
+    # WAL-driven checkpoints every couple of minutes; keep hot pages cached.
+    command: ["postgres", "-c", "max_wal_size=4GB", "-c", "shared_buffers=512MB"]
     environment:
       POSTGRES_USER: observatory_bootstrap
       POSTGRES_DB: observatory

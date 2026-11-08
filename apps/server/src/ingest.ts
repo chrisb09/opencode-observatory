@@ -1,7 +1,7 @@
 import { BatchSchema, type TelemetryEvent } from "@observatory/contracts";
 import { tenant } from "./db.js";
 import { invalidateAnalytics } from "./cache.js";
-import { lockUsage, refreshUsage } from "./rollups.js";
+import { lockUsage, refreshUsage, scheduleRebuild } from "./rollups.js";
 
 export async function ingest(userId: string, payload: unknown) {
   const batch = BatchSchema.parse(payload);
@@ -25,7 +25,9 @@ export async function ingest(userId: string, payload: unknown) {
       `, values(userId, event));
       acknowledged.push(event.eventId);
     }
-    await refreshUsage(db,userId);
+    // Ingest carries only the bounded dirty-key refresh; a warranted full
+    // rebuild (rule or catalog change) is deferred to the background worker.
+    if((await refreshUsage(db,userId,false,true))?.deferred)scheduleRebuild(userId);
     return { acknowledged, receivedAt: Date.now() };
   });
   invalidateAnalytics(userId);

@@ -266,6 +266,42 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     }finally{await pool.query("DELETE FROM market_rates WHERE model_pattern=$1",[model]);}
     expect(await cost()).toBeNull();
   });
+  test("warranted full rebuilds defer to the background worker and reads stay consistent",async()=>{
+    const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
+    const {refreshUsage,rebuildUsage,usageState}=await import("../apps/server/src/rollups.js");
+    const sessionId=`ses_${randomUUID()}`,model=`defer-${randomUUID()}`;
+    const step=(n:number)=>event({sessionId,entityId:`defer-step-${n}`,observedAt:1700000000000+n,revision:1700000001000+n,
+      data:{...event().data,model,reasoningTokens:0,cacheReadTokens:0,inputTokens:1_000_000,outputTokens:100_000}});
+    const ingestStep=async(n:number)=>expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[step(n)]}})).statusCode).toBe(200);
+    await ingestStep(1);
+    const cost=async()=>{invalidateAnalytics(userA);return(await analytics(userA,{sessionId})).summary.market_cost;};
+    expect(await cost()).toBeNull();
+    try{
+      // A catalog change warrants a full rebuild; ingest must acknowledge the
+      // next event without carrying it, and reads must join the background
+      // rebuild before serving the new generation.
+      await pool.query("INSERT INTO market_rates VALUES($1,1,2,0.5,0)",[model]);
+      await ingestStep(2);
+      expect(await cost()).toBeCloseTo(2.4,10);
+      const settled=await tenant(userA,async(db:any)=>usageState(db,userA));
+      expect(settled.ready).toBe(true);expect(settled.current).toBe(true);expect(settled.dirty).toBe(false);
+      // deferFull leaves a warranted rebuild pending instead of running it.
+      await pool.query("UPDATE usage_catalog_version SET revision=revision+1");
+      await tenant(userA,async(db:any)=>{
+        expect((await refreshUsage(db,userA,false,true))?.deferred).toBe(true);
+        const state=await usageState(db,userA);
+        expect(state.current).toBe(false);expect(state.dirty).toBe(false);
+      });
+      // The background worker completes the pending rebuild and reads observe it.
+      await rebuildUsage(userA);
+      const done=await tenant(userA,async(db:any)=>usageState(db,userA));
+      expect(done.ready).toBe(true);expect(done.current).toBe(true);
+      expect(await cost()).toBeCloseTo(2.4,10);
+    }finally{
+      await pool.query("DELETE FROM market_rates WHERE model_pattern=$1",[model]);
+      await rebuildUsage(userA);invalidateAnalytics(userA);
+    }
+  });
   test("current Kimi K3.1 Pro usage receives catalog market pricing",async()=>{
     const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
     const rates=(await pool.query("SELECT model_pattern,input::float8 AS input,output::float8 AS output,cache_read::float8 AS cache_read,cache_write::float8 AS cache_write FROM market_rates WHERE model_pattern IN ('kimi-k3.1-pro','kimi-k3.1-pro-highspeed') ORDER BY model_pattern")).rows;

@@ -251,8 +251,8 @@ bun packages/plugin/dist/cli.js replay   # Reset acknowledged state to replay hi
 
 - **Row-Level Security (RLS):** Every database tenant query operates within a PostgreSQL transaction enforcing `user_id` row-level security. Database credentials used by the application cannot bypass RLS.
 - **Token Normalization:** Automatically reconciles differences between provider-reported inclusive prompt counters and OpenCode's exclusive counters.
-- **Analytics:** Canonical usage facts feed automatically maintained hourly aggregates through PostgreSQL statement triggers. Totals, breakdowns, and charts combine these buckets with exact boundary facts, preserving missing-value and percentile semantics. Tenant-isolated caches avoid repeated work. See [rollup design, maintenance, and benchmarks](scripts/rollups.md).
-- **Reverse Proxy / LAN Deployment:** Set `PUBLIC_URL` in `.env` to your external URL (e.g. `http://192.168.1.148:7692` or `https://observatory.yourdomain.com`). This ensures secure cookie configuration and origin protection.
+- **Analytics:** Canonical usage facts feed automatically maintained hourly aggregates through PostgreSQL statement triggers. Totals, breakdowns, and charts combine these buckets with exact boundary facts, preserving missing-value and percentile semantics. Bounded fact refreshes run inline with ingestion; warranted full rebuilds run on a background worker so requests never carry them. Tenant-isolated caches avoid repeated work. See [rollup design, maintenance, and benchmarks](scripts/rollups.md).
+- **Reverse Proxy / LAN Deployment:** Set `PUBLIC_URL` in `.env` to your external URL (e.g. `http://192.168.1.148:7692` or `https://observatory.yourdomain.com`). This ensures secure cookie configuration and origin protection. Raise your proxy's read timeout well above the default (e.g. `proxy_read_timeout 300s;` in nginx) so legitimate long-running requests are not killed mid-transaction.
 
 ---
 
