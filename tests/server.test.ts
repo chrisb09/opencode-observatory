@@ -302,6 +302,16 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
       await rebuildUsage(userA);invalidateAnalytics(userA);
     }
   });
+  test("recent DeepSeek and Z.ai model identifiers receive reference pricing",async()=>{
+    const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
+    for(const [model,expected] of [["deepseek-v4-1-flash-1017",.21],["deepseek/deepseek-v4.1-flash-1017",.21],["DeepSeek-V4.1-Flash-1017",.21],["zai-glm-5-3-flash",.20],["zai-glm-5-3",1.84],["mistral-large-4",.91]] as const){
+      const sessionId=`ses_${randomUUID()}`,step=event({sessionId,data:{...event().data,model,inputTokens:1_000_000,outputTokens:100_000,reasoningTokens:0,cacheReadTokens:0,cacheWriteTokens:0}});
+      expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[step]}})).statusCode).toBe(200);
+      invalidateAnalytics(userA);
+      const summary=(await analytics(userA,{sessionId})).summary;
+      expect(summary.market_cost).toBeCloseTo(expected,8);expect(summary.unknown_market_calls).toBe(0);
+    }
+  });
   test("current Kimi K3.1 Pro usage receives catalog market pricing",async()=>{
     const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
     const rates=(await pool.query("SELECT model_pattern,input::float8 AS input,output::float8 AS output,cache_read::float8 AS cache_read,cache_write::float8 AS cache_write FROM market_rates WHERE model_pattern IN ('kimi-k3.1-pro','kimi-k3.1-pro-highspeed') ORDER BY model_pattern")).rows;

@@ -123,10 +123,20 @@ export async function migrate() {
         ('grok-4.7', 2.00, 6.00, 0.50, 0.00),
         ('glm-5.3-flash', 0.15, 0.50, 0.03, 0.15),
         ('glm-5.3', 1.40, 4.40, 0.26, 1.40),
+        -- Mistral's names for the same Z.ai models: docs.mistral.ai/models/zai-glm-5-3-flash
+        ('zai-glm-5-3-flash', 0.15, 0.50, 0.03, 0.15),
+        ('zai-glm-5-3', 1.40, 4.40, 0.14, 1.40),
         ('glm-5.2', 1.40, 4.40, 0.26, 1.40),
         ('deepseek-v4-pro', 0.66, 1.98, 0.022, 0.66),
         ('deepseek-v4-flash', 0.22, 0.66, 0.007, 0.22),
         ('deepseek-v4.1-flash', 0.15, 0.60, 0.003, 0.15),
+        -- DeepSeek's off-peak reference rate; peak rates are twice as high.
+        -- https://api-docs.deepseek.com/quick_start/pricing
+        ('deepseek-v4.1-flash-1017', 0.15, 0.60, 0.003, 0.15),
+        ('deepseek-v4-1-flash-1017', 0.15, 0.60, 0.003, 0.15),
+        -- https://docs.mistral.ai/models/mistral-large-4-0
+        ('mistral-large-4', 0.70, 2.10, 0.07, 0.70),
+        ('mistral-large-4-0', 0.70, 2.10, 0.07, 0.70),
         ('minimax-m3.1-flash', 0.15, 0.60, 0.015, 0.00),
         ('minimax-m3', 0.30, 1.20, 0.06, 0.30),
         ('minimax-m2.7', 0.30, 1.20, 0.06, 0.375),
