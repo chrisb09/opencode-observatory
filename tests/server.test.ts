@@ -302,9 +302,9 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
       await rebuildUsage(userA);invalidateAnalytics(userA);
     }
   });
-  test("recent DeepSeek and Z.ai model identifiers receive reference pricing",async()=>{
+  test("recent and locally served model identifiers receive reference pricing",async()=>{
     const {analytics}=await import("../apps/server/src/analytics.js"),{invalidateAnalytics}=await import("../apps/server/src/cache.js");
-    for(const [model,expected] of [["deepseek-v4-1-flash-1017",.21],["deepseek/deepseek-v4.1-flash-1017",.21],["DeepSeek-V4.1-Flash-1017",.21],["zai-glm-5-3-flash",.20],["zai-glm-5-3",1.84],["mistral-large-4",.91]] as const){
+    for(const [model,expected] of [["deepseek-v4-1-flash-1017",.21],["deepseek/deepseek-v4.1-flash-1017",.21],["DeepSeek-V4.1-Flash-1017",.21],["zai-glm-5-3-flash",.20],["zai-glm-5-3",1.84],["mistral-large-4",.91],["qwen-3.8-27b",.3375],["Swift-1.5-Qwen3.8-27B",.3375],["Kimi-K3-1M",4.5],["DeepSeek-V4.1-Flash-HZDR",.21],["deepseek-v4-flash-0731",.0734],["antigravity-gemini-3.8-flash-tiered",1.125],["GPT-OSS-120B",.21],["Qwen3.8-Flash-Next-NVFP4",.197]] as const){
       const sessionId=`ses_${randomUUID()}`,step=event({sessionId,data:{...event().data,model,inputTokens:1_000_000,outputTokens:100_000,reasoningTokens:0,cacheReadTokens:0,cacheWriteTokens:0}});
       expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[step]}})).statusCode).toBe(200);
       invalidateAnalytics(userA);

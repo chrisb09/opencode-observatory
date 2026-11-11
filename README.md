@@ -284,6 +284,10 @@ npm run audit:pricing -- --unpriced
 The pricing audit is read-only and prints model identifiers and aggregate counts; it does not
 print credentials, tenant identities, or telemetry payloads. Use it after a provider releases
 a model to identify usage that still has no reference market rate.
+Market values are indicative estimates, not billing records: locally hosted or renamed models
+may use the rate of a comparable model, including OpenRouter reference prices, and providers,
+time tiers, quantization and cache behavior can differ. When no separate cache-write rate is
+available, some estimates use the input rate. Calls without usable token counts remain unknown.
 
 The benchmark runs three samples per operation, explicitly clearing its own process-local
 cache before each uncached sample and immediately repeating the request to measure reuse.
