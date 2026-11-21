@@ -21,7 +21,8 @@ try {
   await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
   await expect(page.locator(".sidebar")).toBeVisible();
   await expect(page.getByText("Live public analytics are disabled")).toBeVisible();
-  await page.getByRole("button", { name: /Synthetic sample/ }).click();
+  await expect(page.getByText("A limited selection of my actual usage.")).toBeVisible();
+  await page.getByRole("link", { name: "Explore the fuller dashboard with synthetic data" }).click();
   await expect(page.getByRole("region", { name: "Synthetic sample workspace" })).toBeVisible();
   await page.getByRole("button", { name: "Cache reads", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Usage over time" })).toBeVisible();

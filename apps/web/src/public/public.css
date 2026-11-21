@@ -48,6 +48,20 @@
 .public-main {
   min-width: 0;
 }
+.public-main > header,
+.public-main > header .header-controls {
+  flex-wrap: wrap;
+}
+.public-header-note {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.public-header-note a {
+  color: var(--purple);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .public-mode-status {
   display: inline-flex;
   align-items: center;

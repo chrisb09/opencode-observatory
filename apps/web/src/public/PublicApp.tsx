@@ -110,6 +110,12 @@ export function PublicApp() {
             </div>
           </div>
           <div className="header-controls">
+            {mode === "live" && <div className="public-header-note">
+              A limited selection of my actual usage.{" "}
+              <a href="/public/sample" onClick={event => { event.preventDefault(); change("sample"); }}>
+                Explore the fuller dashboard with synthetic data
+              </a>.
+            </div>}
             <div className={`live public-mode-status ${mode}`}>
               {mode === "live" ? (
                 <>
