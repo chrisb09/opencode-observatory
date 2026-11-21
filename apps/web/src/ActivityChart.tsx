@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { BarChart, Bar, Cell, LabelList, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { formatMetric, metricLabel, type UsageMetric } from "./chartMetrics";
+import { formatMetric, metricLabel, type ChartMetric } from "./chartMetrics";
 import type { ChartGroup } from "./colors";
 
-export function ActivityChart({ groups, metric, colors, title }: { groups: ChartGroup[]; metric: UsageMetric; colors: Record<string, string>; title: string }) {
+export function ActivityChart({ groups, metric, colors, title }: { groups: ChartGroup[]; metric: ChartMetric; colors: Record<string, string>; title: string }) {
   const [width, setWidth] = useState(400);
   const leaders = [...groups].sort((a: any, b: any) => Number(b[metric] ?? -1) - Number(a[metric] ?? -1) || a.id.localeCompare(b.id)).slice(0, 8);
   const data = leaders.map((g: any) => ({ ...g, value: g[metric] == null ? null : Number(g[metric]) }));

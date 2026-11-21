@@ -104,21 +104,9 @@ function dimensionFilter(f:Filters,values:unknown[]) {
   for(const key of ["account","credential"] as const)if(f[key]){const p=bind(f[key]);conditions.push(`(${field(`${key}_id`)}=${p} OR ${field(`${key}_id`)}=${field("provider")}||'/'||${p})`);}
   return conditions.length?" AND "+conditions.join(" AND "):"";
 }
-export async function usageBuckets(db:PoolClient,userId:string,f:Filters):Promise<{buckets:UsageBucket[];earliest:number|null}> {
-  // Keep complete buckets and boundary facts on the same canonical generation.
-  // A warranted full rebuild runs on the background worker while this
-  // transaction holds no advisory lock; reads join it instead of deadlocking.
-  for(let attempt=0;attempt<3;attempt++) {
-    const state=await usageState(db,userId);
-    if(state.ready&&state.current)break;
-    await rebuildUsage(userId);
-  }
-  await lockUsage(db,userId);
-  if((await refreshUsage(db,userId,false,true))?.deferred) {
-    // A rule or catalog change raced the pre-check and this lock; carry the
-    // rebuild inline so this read never serves a stale generation.
-    await refreshUsage(db,userId);
-  }
+// Strictly read-only: callers must already hold a repeatable-read snapshot and
+// have verified the rollup state. This function never rebuilds or refreshes.
+async function readUsageBuckets(db:PoolClient,userId:string,f:Filters):Promise<{buckets:UsageBucket[];earliest:number|null}> {
   const values:unknown[]=[userId],scope=dimensionFilter(f,values);
   const bind=(value:unknown)=>{values.push(value);return `$${values.length}`;};
   let exact="";
@@ -146,4 +134,28 @@ export async function usageBuckets(db:PoolClient,userId:string,f:Filters):Promis
     if(!row.histogram){if(row.duration!==null)histogram[`d:${row.duration}`]=1;if(row.output!==null)histogram[`o:${row.output}`]=1;}
     return {time:Number(row.time),dimensions:row.dimensions,metrics:row.metrics.map(Number),histogram};
   })};
+}
+export async function usageBuckets(db:PoolClient,userId:string,f:Filters):Promise<{buckets:UsageBucket[];earliest:number|null}> {
+  // Keep complete buckets and boundary facts on the same canonical generation.
+  // A warranted full rebuild runs on the background worker while this
+  // transaction holds no advisory lock; reads join it instead of deadlocking.
+  for(let attempt=0;attempt<3;attempt++) {
+    const state=await usageState(db,userId);
+    if(state.ready&&state.current)break;
+    await rebuildUsage(userId);
+  }
+  await lockUsage(db,userId);
+  if((await refreshUsage(db,userId,false,true))?.deferred) {
+    // A rule or catalog change raced the pre-check and this lock; carry the
+    // rebuild inline so this read never serves a stale generation.
+    await refreshUsage(db,userId);
+  }
+  return readUsageBuckets(db,userId,f);
+}
+// Public reads must never carry a rebuild or refresh. They observe the same
+// generation their state check saw because the caller uses REPEATABLE READ.
+export async function usageBucketsReadOnly(db:PoolClient,userId:string,f:Filters):Promise<{buckets:UsageBucket[];earliest:number|null}|null> {
+  const state=await usageState(db,userId);
+  if(!state||state.ready!==true||state.current!==true||state.dirty===true)return null;
+  return readUsageBuckets(db,userId,f);
 }

@@ -12,6 +12,7 @@ import { ingest } from "./ingest.js";
 import { storeContent, storeSummary, memoryCoverage, sessionMemory } from "./memory.js";
 import { applyClaims, listVaultClaims, listVaultConcepts, listVaultConflicts, readVaultLog, readVaultNote } from "./vault-service.js";
 import { analytics, listEntities, dimensions, machines, errorBreakdown } from "./analytics.js";
+import { publicAnalytics, PublicAnalyticsUnavailable } from "./public-analytics.js";
 import { registerMcp } from "./mcp.js";
 import { invalidateAnalytics } from "./cache.js";
 
@@ -111,6 +112,16 @@ export async function buildApp(logger = true) {
   app.get("/api/vault/note",async request=>readVaultNote((await authenticate(request,"read")).id,request.query));
   app.get("/api/vault/log",async request=>readVaultLog((await authenticate(request,"read")).id,request.query));
   app.get("/api/analytics",async request=>analytics((await authenticate(request,"read")).id,request.query));
+  // Explicit environment opt-in only. Disabled is indistinguishable from an
+  // unknown anonymous route; stale public rollups return 503 instead of
+  // rebuilding on the request path.
+  app.get("/api/public/analytics",{config:{rateLimit:{max:30,timeWindow:"1 minute"}}},async(request,reply)=>{
+    try{return await publicAnalytics(request.query);}
+    catch(error){
+      if(error instanceof PublicAnalyticsUnavailable)return reply.code(503).header("Retry-After",String(error.retryAfterSeconds)).send({error:error.message});
+      throw error;
+    }
+  });
   app.get("/api/dimensions",async request=>dimensions((await authenticate(request,"read")).id));
   app.get("/api/machines",async request=>machines((await authenticate(request,"read")).id));
   app.get("/api/errors",async request=>errorBreakdown((await authenticate(request,"read")).id,request.query));

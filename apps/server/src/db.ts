@@ -14,6 +14,20 @@ export async function tenant<T>(userId: string, run: (db: pg.PoolClient) => Prom
   finally { db.release(); }
 }
 
+// Anonymous/public reads use a stable, read-only snapshot. RLS is still
+// enforced by setting the tenant on the same connection before any query.
+export async function tenantRead<T>(userId: string, run: (db: pg.PoolClient) => Promise<T>): Promise<T> {
+  const db = await pool.connect();
+  try {
+    await db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await db.query("SELECT set_config('observatory.user_id', $1, true)", [userId]);
+    const value = await run(db);
+    await db.query("COMMIT");
+    return value;
+  } catch (error) { await db.query("ROLLBACK"); throw error; }
+  finally { db.release(); }
+}
+
 export async function migrate() {
   const db = await pool.connect();
   try {

@@ -29,6 +29,11 @@ services:
       DATABASE_URL: postgresql://observatory_app:${APP_DB_PASSWORD}@db:5432/observatory
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run npm run setup:env}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:7692}
+      # Public analytics is disabled unless a single tenant is explicitly selected.
+      # Labels are JSON maps from internal names to approved public display names.
+      PUBLIC_ANALYTICS_TENANT_ID: ${PUBLIC_ANALYTICS_TENANT_ID:-}
+      PUBLIC_ANALYTICS_PROVIDER_LABELS: ${PUBLIC_ANALYTICS_PROVIDER_LABELS:-}
+      PUBLIC_ANALYTICS_MODEL_LABELS: ${PUBLIC_ANALYTICS_MODEL_LABELS:-}
       NODE_ENV: production
       PORT: 7692
       WEB_ROOT: /app/apps/web/dist

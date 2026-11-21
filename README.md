@@ -70,6 +70,40 @@ Open **http://localhost:7692** in your browser and sign in. Go to **Settings** t
 
 *(Optional: If you did not set `ADMIN_EMAIL` in `.env`, create the first administrator interactively with `docker compose exec -it app node --import tsx apps/server/src/admin.ts` or `npm run setup:admin`.)*
 
+### Optional public demo
+
+The `/public` page offers a live, read-only aggregate dashboard and a separately
+labeled synthetic workspace for exploring detailed views. Public analytics are
+**disabled by default**. To enable them, explicitly configure one workspace ID
+as `PUBLIC_ANALYTICS_TENANT_ID`; it must be a user UUID, not an API key. Set
+`PUBLIC_ANALYTICS_PROVIDER_LABELS` and `PUBLIC_ANALYTICS_MODEL_LABELS` to JSON
+objects mapping internal identifiers to approved public labels. Model keys use
+`provider/model` syntax. Unmapped identifiers are grouped as `Other` rather than
+published. Review labels before enabling: their values are visible to anyone.
+Compose deployments can put these non-secret settings in a local, git-ignored
+`compose.override.yaml`, so ordinary Compose rebuilds retain the configuration:
+
+```yaml
+services:
+  app:
+    environment:
+      PUBLIC_ANALYTICS_TENANT_ID: "workspace-uuid-here"
+      PUBLIC_ANALYTICS_PROVIDER_LABELS: '{"openai":"OpenAI"}'
+      PUBLIC_ANALYTICS_MODEL_LABELS: '{"openai/example-model":"Example Model"}'
+```
+
+Only completed hourly intervals within the rolling last seven days are queryable;
+custom range boundaries are rounded inward to whole hours. Data
+includes model/provider aggregates, tokens, recorded costs, and estimated market
+values. These totals and activity patterns are public and visitors can retain
+snapshots to build a longer history. Recorded cost is not a bill, and market
+value is an estimated API equivalent. Accounts, credential fingerprints,
+machines, sessions, prompts and other detailed records are not included in the
+live public API. Detailed attempt and context-utilization statistics are unavailable
+in the live view; the sample workspace is fictional and is never mixed with live
+data. Keep your reverse proxy's private-route protections and configure trusted
+proxies carefully when using IP-based rate limiting.
+
 ---
 
 ## Connect the OpenCode Plugin

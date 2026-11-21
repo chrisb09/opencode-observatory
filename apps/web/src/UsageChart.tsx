@@ -1,11 +1,11 @@
 import { useId, useMemo, useState } from "react";
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { usageChartData } from "./chartData";
-import { formatMetric, seriesKey, type UsageMetric } from "./chartMetrics";
+import { formatMetric, seriesKey, type ChartMetric } from "./chartMetrics";
 import type { ChartGroup } from "./colors";
 export { modelColor } from "./colors";
 
-export function UsageChart({ stats, metric, groups, colors, grouped = true, groupLabel }: { stats: any; metric: UsageMetric; groups: ChartGroup[]; colors: Record<string, string>; grouped?: boolean; groupLabel: string }) {
+export function UsageChart({ stats, metric, groups, colors, grouped = true, groupLabel }: { stats: any; metric: ChartMetric; groups: ChartGroup[]; colors: Record<string, string>; grouped?: boolean; groupLabel: string }) {
   const [showTotal, setShowTotal] = useState(false), [hidden, setHidden] = useState<Set<string>>(new Set()), [extra, setExtra] = useState<Set<string>>(new Set());
   const [cumulative, setCumulative] = useState(false), [smooth, setSmooth] = useState(true);
   const gradient = useId();
@@ -19,7 +19,7 @@ export function UsageChart({ stats, metric, groups, colors, grouped = true, grou
   const label = (id: string) => groups.find(g => g.id === id)?.label ?? id;
   const other = groups.length > displayed.length;
   return <section className="panel usage-panel">
-    <div className="panel-title"><div><h2>Usage over time</h2><p>{stats.timeframe.bucket.replace("six-hour", "6-hour")} intervals · local timezone{metric === "total_tokens" ? " · includes cache and reasoning" : metric === "calls" ? " · model calls" : " · USD"}</p></div></div>
+    <div className="panel-title"><div><h2>Usage over time</h2><p>{stats.timeframe.bucket.replace("six-hour", "6-hour")} intervals · local timezone{metric === "total_tokens" ? " · includes cache and reasoning" : metric === "calls" ? " · model calls" : metric === "cache_read_tokens" ? " · cache-read tokens" : " · USD"}</p></div></div>
     <div className="chart-controls"><label><input type="checkbox" checked={smooth} onChange={e => setSmooth(e.target.checked)}/>Smooth curves</label><label><input type="checkbox" checked={cumulative} onChange={e => setCumulative(e.target.checked)}/>Cumulative</label>{cumulative && <small>Running measured total within this timeframe</small>}</div>
     <div className="chart"><ResponsiveContainer width="100%" height={260}><ComposedChart data={data} margin={{ right: 16 }}>
       <defs><linearGradient id={gradient} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--purple)" stopOpacity={.22}/><stop offset="100%" stopColor="var(--purple)" stopOpacity={0}/></linearGradient></defs>

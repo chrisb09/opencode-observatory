@@ -13,6 +13,7 @@ import { AccountAssignments } from "./AccountAssignments";
 import { money, chartTooltipStyle } from "./format";
 import { ThemeControl } from "./Theme";
 import { DistributionChart } from "./DistributionChart";
+import { PublicApp } from "./public/PublicApp";
 
 type User={id:string;email:string;admin:boolean};
 type Entity={entity_id:string;installation_id:string;machine:string;session_id:string;message_id:string;observed_at:string;historical:boolean;runtime:any;data:any;alias?:string};
@@ -447,4 +448,5 @@ function SettingsPage({user,onError}:{user:User;onError:(e:string)=>void}){
   </div>;
 }
 
-createRoot(document.getElementById("root")!).render(<App/>);
+const publicRoute = location.pathname === "/public" || location.pathname.startsWith("/public/");
+createRoot(document.getElementById("root")!).render(publicRoute ? <PublicApp/> : <App/>);

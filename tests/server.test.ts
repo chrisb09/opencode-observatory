@@ -7,7 +7,7 @@ import {claimKey} from "../apps/server/src/vault-model.js";
 const enabled=!!process.env.TEST_DATABASE_URL;
 if(enabled){process.env.DATABASE_URL=process.env.TEST_DATABASE_URL;process.env.ENCRYPTION_KEY=randomBytes(32).toString("hex");process.env.PUBLIC_URL="http://localhost:7692";}
 describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
-  let app:any,pool:any,tenant:any,userA:string,userB:string,keyA:string,keyB:string,cookie:string,vaultRoot:string,sessionId="ses_"+randomUUID();
+  let app:any,pool:any,tenant:any,userA:string,userB:string,userC:string,keyA:string,keyB:string,keyC:string,cookie:string,vaultRoot:string,sessionId="ses_"+randomUUID();
   const password="integration-only-password-long";
   const origin={origin:"http://localhost:7692"};
   const bearer=(key:string)=>({authorization:`Bearer ${key}`});
@@ -15,14 +15,15 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     const db=await import("../apps/server/src/db.js");pool=db.pool;tenant=db.tenant;await db.migrate();
     vaultRoot=await mkdtemp("/tmp/opencode/vault-api-test-");process.env.VAULT_ROOT=vaultRoot;
     const security=await import("../apps/server/src/security.js");
-    const suffix=randomUUID();userA=await security.createUser(`a-${suffix}@example.test`,password,true);userB=await security.createUser(`b-${suffix}@example.test`,password);
+    const suffix=randomUUID();userA=await security.createUser(`a-${suffix}@example.test`,password,true);userB=await security.createUser(`b-${suffix}@example.test`,password);userC=await security.createUser(`c-${suffix}@example.test`,password);
     app=await (await import("../apps/server/src/app.js")).buildApp(false);
     const login=await app.inject({method:"POST",url:"/api/auth/login",headers:origin,payload:{email:`a-${suffix}@example.test`,password}});expect(login.statusCode).toBe(200);cookie=String(Array.isArray(login.headers["set-cookie"])?login.headers["set-cookie"][0]:login.headers["set-cookie"]).split(";")[0];
     const result=await app.inject({method:"POST",url:"/api/keys",headers:{...origin,cookie},payload:{name:"client",scopes:["ingest","read"]}});expect(result.statusCode).toBe(200);keyA=result.json().key;
     keyB=`obs_${security.token()}`;await pool.query("INSERT INTO api_keys VALUES($1,$2,$3,$4,$5,$6,now(),NULL,NULL)",[randomUUID(),userB,"client-b",security.hash(keyB),security.encrypt(keyB),["ingest","read"]]);
+    keyC=`obs_${security.token()}`;await pool.query("INSERT INTO api_keys VALUES($1,$2,$3,$4,$5,$6,now(),NULL,NULL)",[randomUUID(),userC,"client-c",security.hash(keyC),security.encrypt(keyC),["ingest","read"]]);
   });
   afterAll(async()=>{
-    await app?.close();if(pool){await pool.query("DELETE FROM invitations WHERE created_by=ANY($1::uuid[])",[[userA,userB].filter(Boolean)]);await pool.query("DELETE FROM users WHERE id=ANY($1::uuid[])",[[userA,userB].filter(Boolean)]);await pool.end();}
+    await app?.close();if(pool){await pool.query("DELETE FROM invitations WHERE created_by=ANY($1::uuid[])",[[userA,userB,userC].filter(Boolean)]);await pool.query("DELETE FROM users WHERE id=ANY($1::uuid[])",[[userA,userB,userC].filter(Boolean)]);await pool.end();}
     if(vaultRoot)await rm(vaultRoot,{recursive:true,force:true});
   });
   test("anonymous users cannot read usage or ingest; browser CSRF and key-management boundaries hold",async()=>{
@@ -467,6 +468,134 @@ describe.skipIf(!enabled)("PostgreSQL end-to-end API and MCP",()=>{
     await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyA),payload:{events:[ambiguous]}});
     const after=(await app.inject({url:`/api/entities/attempt?sessionId=${session}`,headers:bearer(keyA)})).json();expect(after.summary.known_usage).toBe(1);expect(after.items.find((row:any)=>row.entity_id==="attempt_recovery_1").data.totalTokens).toBeNull();
   });
+  describe("public analytics",()=>{
+    const keys=["PUBLIC_ANALYTICS_TENANT_ID","PUBLIC_ANALYTICS_PROVIDER_LABELS","PUBLIC_ANALYTICS_MODEL_LABELS"] as const;
+    const withEnv=async(values:Partial<Record<typeof keys[number],string|undefined>>,run:()=>Promise<void>)=>{
+      const saved=Object.fromEntries(keys.map(key=>[key,process.env[key]])) as Record<string,string|undefined>;
+      try{for(const key of keys){const value=values[key];if(value===undefined)delete process.env[key];else process.env[key]=value;}await run();}
+      finally{for(const key of keys){const value=saved[key];if(value===undefined)delete process.env[key];else process.env[key]=value;}}
+    };
+    const providerLabels={openai:"OpenAI",google:"Google"};
+    const modelLabels={"openai/test-model":"Test Model","google/gemini-3.8-flash":"Gemini 3.8 Flash","openai/boundary-model":"Boundary Model"};
+    const enabled=(overrides:Partial<Record<typeof keys[number],string|undefined>>={})=>({
+      PUBLIC_ANALYTICS_TENANT_ID:userC,
+      PUBLIC_ANALYTICS_PROVIDER_LABELS:JSON.stringify(providerLabels),
+      PUBLIC_ANALYTICS_MODEL_LABELS:JSON.stringify(modelLabels),
+      ...overrides,
+    });
+    const metrics=["calls","input_tokens","output_tokens","reasoning_tokens","cache_read_tokens","cache_write_tokens","prompt_tokens","completion_tokens","total_tokens","cost","market_cost","cache_savings","savings","failures","imported_calls","unknown_cost_calls","unknown_market_calls","unknown_usage_calls","known_cache_calls","cache_hit_calls","cache_reuse_ratio","cache_hit_ratio","p50_ms","p95_ms","p50_output_tokens","p95_output_tokens"];
+    const seriesMetrics=metrics.filter(key=>!key.startsWith("p50_")&&!key.startsWith("p95_"));
+    const top=["contextDistribution","contextPercentiles","groupBy","groupSeries","groups","modelGroups","outputDistribution","providerGroups","series","summary","timeframe","transport"];
+    // The first ingest for a tenant defers its warranted full rebuild to the
+    // background worker; tests wait for that worker before reading publicly.
+    const settle=async()=>{const {rebuildUsage}=await import("../apps/server/src/rollups.js");await rebuildUsage(userC);};
+
+    test("is disabled by default, fails closed on invalid opt-in, and leaves private auth unchanged",async()=>{
+      await withEnv({PUBLIC_ANALYTICS_TENANT_ID:undefined,PUBLIC_ANALYTICS_PROVIDER_LABELS:undefined,PUBLIC_ANALYTICS_MODEL_LABELS:undefined},async()=>{
+        expect((await app.inject("/api/public/analytics")).statusCode).toBe(404);
+        expect((await app.inject("/api/analytics")).statusCode).toBe(401);
+      });
+      await withEnv({PUBLIC_ANALYTICS_TENANT_ID:"not-a-tenant",PUBLIC_ANALYTICS_PROVIDER_LABELS:JSON.stringify(providerLabels),PUBLIC_ANALYTICS_MODEL_LABELS:JSON.stringify(modelLabels)},async()=>{
+        expect((await app.inject("/api/public/analytics")).statusCode).toBe(404);
+      });
+      await withEnv(enabled({PUBLIC_ANALYTICS_MODEL_LABELS:"not-json"}),async()=>{
+        expect((await app.inject("/api/public/analytics")).statusCode).toBe(404);
+      });
+    });
+
+    test("publishes only explicitly mapped provider and model labels, hides identities, and honors safe filters",async()=>{
+      const now=Date.now(),installationId=randomUUID(),session=`ses_public_${randomUUID()}`;
+      const base=event().data;
+      const mappedOpenai=event({installationId,sessionId:session,entityId:"pub_openai",machine:"private-machine",observedAt:now-3*3600000,data:{...base,provider:"openai",model:"test-model",account:"hmac:leak-account",credential:"hmac:leak-key"}});
+      const mappedGoogle=event({installationId,sessionId:session,entityId:"pub_google",machine:"private-machine",observedAt:now-2*3600000,data:{...base,provider:"google",model:"gemini-3.8-flash",account:"hmac:leak-account",credential:"hmac:leak-key"}});
+      const unmapped=event({installationId,sessionId:session,entityId:"pub_private",machine:"private-machine",observedAt:now-3600000,data:{...base,provider:"local-endpoint",model:"private-model",account:"hmac:leak-account",credential:"hmac:leak-key"}});
+      const attempt=event({installationId,sessionId:session,kind:"attempt",entityId:"pub_attempt",messageId:"msg_pub_attempt",observedAt:now-1800000,data:{...base,provider:"openai",model:"test-model",purpose:"chat",contextLimit:200,firstOutputMs:120,durationMs:200}});
+      expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyC),payload:{events:[mappedOpenai,mappedGoogle,unmapped,attempt]}})).statusCode).toBe(200);
+      await settle();
+      // A different tenant has the same mapped raw model; it must not contribute.
+      expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyB),payload:{events:[event({sessionId:`ses_other_${randomUUID()}`,observedAt:now-60000})]}})).statusCode).toBe(200);
+      await withEnv(enabled(),async()=>{
+        const response=await app.inject("/api/public/analytics");expect(response.statusCode).toBe(200);
+        const body=response.json();
+        expect(Object.keys(body).sort()).toEqual([...top].sort());
+        expect(Object.keys(body.summary).sort()).toEqual([...metrics].sort());
+        expect(Object.keys(body.timeframe).sort()).toEqual(["bucket","endExclusive","from","timezone","to"]);
+        expect(Object.keys(body.transport).sort()).toEqual(["attempts","cancelled","failed","first_output_ms"]);
+        expect(Object.keys(body.contextPercentiles).sort()).toEqual(["p50_ratio","p95_ratio"]);
+        expect(body.summary.calls).toBe(3);
+        expect(body.summary.account_count).toBeUndefined();expect(body.summary.credential_count).toBeUndefined();
+        expect(body.providerGroups.map((group:any)=>group.label).sort()).toEqual(["Google","OpenAI","Other"].sort());
+        expect(body.providerGroups.map((group:any)=>group.id)).not.toContain("local-endpoint");
+        expect(body.modelGroups.map((group:any)=>group.label).sort()).toEqual(["Gemini 3.8 Flash","Other","Test Model"].sort());
+        expect(body.groups[0]).toBeDefined();
+        expect(Object.keys(body.groups[0]).sort()).toEqual(["id","label","provider",...metrics].sort());
+        expect(Object.keys(body.providerGroups[0]).sort()).toEqual(["id","label",...metrics].sort());
+        expect(Object.keys(body.series[0]).sort()).toEqual(["time",...seriesMetrics].sort());
+        expect(Object.keys(body.groupSeries[0]).sort()).toEqual(["id","label","provider","series"].sort());
+        expect(body.transport.attempts).toBeNull();
+        expect(body.contextDistribution).toEqual([]);
+        expect(body.contextPercentiles.p50_ratio).toBeNull();
+        const text=JSON.stringify(body);
+        for(const secret of ["local-endpoint","private-model","private-machine","hmac:leak-account","hmac:leak-key",userC,keyC,"account_count","credential_count","accountGroups","credentialGroups"])expect(text).not.toContain(secret);
+        const openai=(await app.inject("/api/public/analytics?provider=OpenAI")).json();expect(openai.summary.calls).toBe(1);expect(openai.groups.map((g:any)=>g.label)).toEqual(["Test Model"]);
+        const other=(await app.inject("/api/public/analytics?model=Other")).json();expect(other.summary.calls).toBe(1);expect(other.providerGroups.map((g:any)=>g.label)).toEqual(["Other"]);
+        const intersection=(await app.inject("/api/public/analytics?provider=OpenAI&model=Other")).json();expect(intersection.summary.calls).toBe(0);
+        for(const url of ["/api/public/analytics?provider=local-endpoint","/api/public/analytics?model=private-model","/api/public/analytics?account=hmac%3Aleak-account","/api/public/analytics?machine=private-machine","/api/public/analytics?groupBy=account","/api/public/analytics?foo=1"]){
+          expect((await app.inject(url)).statusCode).toBe(400);
+        }
+      });
+    });
+
+    test("enforces a rolling seven-day [from,to) window with strict timestamps",async()=>{
+      const now=Date.now(),week=7*86400000,installationId=randomUUID(),session=`ses_boundary_${randomUUID()}`,base=event().data;
+      const make=(id:string,time:number)=>event({installationId,sessionId:session,entityId:id,observedAt:time,data:{...base,provider:"openai",model:"boundary-model"}});
+      expect((await app.inject({method:"POST",url:"/api/ingest",headers:bearer(keyC),payload:{events:[make("boundary_old",now-week-1),make("boundary_edge",now-week),make("boundary_recent",now-1000),make("boundary_now",now),make("boundary_future",now+1)]}})).statusCode).toBe(200);
+      await settle();
+      await withEnv(enabled(),async()=>{
+        const {publicAnalytics}=await import("../apps/server/src/public-analytics.js");
+        const publicUrl=(query:Record<string,unknown>)=>{const params=new URLSearchParams();for(const [key,value] of Object.entries(query))if(value!==undefined)params.set(key,String(value));return `/api/public/analytics?${params}`;};
+        const result=await publicAnalytics({model:"Boundary Model"}, {now});
+        expect(result.timeframe.from%3600000).toBe(0);
+        expect(result.timeframe.to%3600000).toBe(0);
+        expect(result.timeframe.bucket).toBe("hour");
+        expect(result.timeframe.from).toBeGreaterThanOrEqual(now-week);
+        expect(result.timeframe.to).toBeLessThanOrEqual(now);
+        expect(result.summary.calls).toBe(0);
+        await expect(publicAnalytics({model:"Boundary Model",from:now-1000}, {now})).rejects.toThrow();
+        for(const query of [
+          {model:"Boundary Model",from:now-week-1},
+          {model:"Boundary Model",to:now+60000},
+          {model:"Boundary Model",from:now,to:now},
+          {model:"Boundary Model",to:now-week},
+          {model:"Boundary Model",from:"-1"},
+          {model:"Boundary Model",from:"1.5"},
+          {model:"Boundary Model",from:"0x10"},
+          {model:"Boundary Model",groupBy:"account"},
+          {model:"Boundary Model",provider:"local-endpoint"},
+        ]){const url=publicUrl(query),status=(await app.inject(url)).statusCode;if(status!==400)throw new Error(`Expected 400 for ${url}, got ${status}`);}
+      });
+    });
+
+    test("returns 503 while rollups are stale and never starts an inline rebuild",async()=>{
+      const installationId=randomUUID();
+      await tenant(userC,async(db:any)=>{
+        await db.query("INSERT INTO usage_rollup_state(user_id,ready) VALUES($1,false) ON CONFLICT(user_id) DO UPDATE SET ready=false",[userC]);
+        await db.query("INSERT INTO usage_dirty(user_id,installation_id,kind,entity_id) VALUES($1,$2,'step','stale-public-test') ON CONFLICT DO NOTHING",[userC,installationId]);
+      });
+      await withEnv(enabled(),async()=>{
+        const response=await app.inject("/api/public/analytics");expect(response.statusCode).toBe(503);expect(response.headers["retry-after"]).toBeDefined();
+        const state=await tenant(userC,async(db:any)=>({
+          rollup:(await db.query("SELECT ready FROM usage_rollup_state WHERE user_id=$1",[userC])).rows[0],
+          dirty:(await db.query("SELECT count(*)::int AS n FROM usage_dirty WHERE user_id=$1",[userC])).rows[0].n,
+        }));
+        expect(state.rollup.ready).toBe(false);expect(state.dirty).toBe(1);
+      });
+      const {refreshUsage}=await import("../apps/server/src/rollups.js");
+      await tenant(userC,(db:any)=>refreshUsage(db,userC,true));
+      await withEnv(enabled(),async()=>{expect((await app.inject("/api/public/analytics")).statusCode).toBe(200);});
+    });
+  });
+
   test("bootstrapAdmin is safe, idempotent, and does not overwrite existing administrators",async()=>{
     const { bootstrapAdmin } = await import("../apps/server/src/security.js");
     const logs: string[] = [];
