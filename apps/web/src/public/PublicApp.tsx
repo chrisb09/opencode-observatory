@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { Activity, FlaskConical, LockKeyhole, ShieldCheck } from "lucide-react";
+import { Activity, FlaskConical, ShieldCheck } from "lucide-react";
 import { ThemeControl } from "../Theme";
 import { LiveDashboard } from "./LiveDashboard";
-import { SampleWorkspace } from "./SampleWorkspace";
+import { SampleWorkspace, sampleViews, type SampleView } from "./SampleWorkspace";
 import "./public.css";
 
 type Mode = "live" | "sample";
@@ -10,10 +10,13 @@ const modeFromPath = (): Mode => (location.pathname.replace(/\/+$/, "") === "/pu
 
 export function PublicApp() {
   const [mode, setMode] = useState<Mode>(modeFromPath);
+  const [sampleView, setSampleView] = useState<SampleView>("overview");
+  const sampleViewLabel = sampleViews.find(item => item.id === sampleView)?.label ?? "Overview";
 
   useEffect(() => {
-    document.title = mode === "sample" ? "Synthetic sample · Observatory" : "Public analytics · Observatory";
-  }, [mode]);
+    document.title =
+      mode === "sample" ? `${sampleViewLabel} · Synthetic sample · Observatory` : "Public analytics · Observatory";
+  }, [mode, sampleViewLabel]);
 
   useEffect(() => {
     const sync = () => setMode(modeFromPath());
@@ -28,11 +31,16 @@ export function PublicApp() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  const chooseSampleView = (next: SampleView) => {
+    setSampleView(next);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   return (
-    <div className={`public-shell public-mode-${mode}`}>
-      <header className="public-topbar">
+    <div className={`app public-shell public-mode-${mode}`}>
+      <aside className="sidebar public-sidebar">
         <a
-          className="brand public-brand"
+          className="brand"
           href="/public"
           onClick={event => {
             event.preventDefault();
@@ -44,57 +52,90 @@ export function PublicApp() {
           </div>
           <div>
             Observatory
-            <small>PUBLIC ANALYTICS</small>
+            <small>OPENCODE ANALYTICS</small>
           </div>
         </a>
-        <nav className="public-mode-tabs" aria-label="Public data mode">
-          <button className={mode === "live" ? "active" : ""} aria-pressed={mode === "live"} onClick={() => change("live")}>
-            <Activity size={15} /> Live aggregate
-            <span className="mode-dot live-dot" />
+
+        <div className="nav-label">WORKSPACE</div>
+        <nav className="public-mode-nav" aria-label="Public data mode">
+          <button className={`mode-live ${mode === "live" ? "active" : ""}`} aria-pressed={mode === "live"} onClick={() => change("live")}>
+            <Activity size={18} /> Live aggregate
+            {mode === "live" && <span className="nav-dot" />}
           </button>
-          <button className={mode === "sample" ? "active sample-tab" : ""} aria-pressed={mode === "sample"} onClick={() => change("sample")}>
-            <FlaskConical size={15} /> Synthetic sample
-            <span className="mode-dot sample-dot" />
+          <button className={`mode-sample ${mode === "sample" ? "active" : ""}`} aria-pressed={mode === "sample"} onClick={() => change("sample")}>
+            <FlaskConical size={18} /> Synthetic sample
+            {mode === "sample" && <span className="nav-dot" />}
           </button>
         </nav>
-        <div className="public-top-actions">
-          <span className={`public-mode-pill ${mode === "live" ? "live" : "sample"}`}>
-            {mode === "live" ? <ShieldCheck size={13} /> : <FlaskConical size={13} />}
-            {mode === "live" ? "LIVE · AGGREGATE ONLY" : "SAMPLE · FICTIONAL DATA"}
-          </span>
-          <ThemeControl />
-        </div>
-      </header>
 
-      <div className={`public-boundary ${mode === "live" ? "live" : "sample"}`} role="note">
-        {mode === "live" ? (
+        {mode === "sample" && (
           <>
-            <ShieldCheck size={15} />
-            <strong>LIVE PUBLIC VIEW</strong>
-            <span>Allowlisted aggregates only · no sign-in, accounts, credentials, machines, sessions, prompts, or exports.</span>
-          </>
-        ) : (
-          <>
-            <FlaskConical size={15} />
-            <strong>SYNTHETIC SAMPLE WORKSPACE</strong>
-            <span>Fictional demonstration data · read-only · never fetched from, mixed with, or written to live analytics.</span>
+            <div className="nav-label public-nav-label">SAMPLE VIEWS</div>
+            <nav className="public-sample-nav" aria-label="Synthetic sample sections">
+              {sampleViews.map(item => (
+                <button
+                  key={item.id}
+                  className={sampleView === item.id ? "active" : ""}
+                  aria-current={sampleView === item.id ? "page" : undefined}
+                  onClick={() => chooseSampleView(item.id)}
+                >
+                  <item.icon size={18} />
+                  {item.label}
+                  {sampleView === item.id && <span className="nav-dot" />}
+                </button>
+              ))}
+            </nav>
           </>
         )}
-        <span className="public-boundary-lock">
-          <LockKeyhole size={12} /> Credentials omitted
-        </span>
-      </div>
 
-      <main className="public-main">{mode === "live" ? <LiveDashboard onOpenSample={() => change("sample")} /> : <SampleWorkspace />}</main>
+        <div className="sidebar-bottom">
+          <span className={`connection public-connection ${mode}`}>
+            <i />
+            {mode === "live" ? "Live · aggregate only" : "Synthetic · fictional data"}
+          </span>
+          <p className={`public-sidebar-note ${mode}`}>
+            {mode === "live"
+              ? "Allowlisted model and provider totals. No accounts, credentials, machines, sessions, prompts, or exports."
+              : "Read-only demonstration. Nothing is sent, saved, or connected to live analytics."}
+          </p>
+        </div>
+      </aside>
 
-      <footer className="public-footer">
-        <span>OpenCode Observatory · public analytics</span>
-        <span>
-          {mode === "live"
-            ? "Live aggregate view. Account, credential, and machine identities are never part of this route."
-            : "Synthetic sample workspace. Every name and number is fictional."}
-        </span>
-      </footer>
+      <main className="public-main">
+        <header>
+          <div className="header-title">
+            <h1>{mode === "sample" ? sampleViewLabel : "Overview"}</h1>
+            <div className="breadcrumb">
+              Public analytics <span>/</span> {mode === "sample" ? "Synthetic sample" : "Overview"}
+            </div>
+          </div>
+          <div className="header-controls">
+            <div className={`live public-mode-status ${mode}`}>
+              {mode === "live" ? (
+                <>
+                  <ShieldCheck size={14} /> Aggregate only
+                </>
+              ) : (
+                <>
+                  <FlaskConical size={14} /> Synthetic data
+                </>
+              )}
+            </div>
+            <ThemeControl />
+          </div>
+        </header>
+
+        {mode === "live" ? <LiveDashboard onOpenSample={() => change("sample")} /> : <SampleWorkspace view={sampleView} />}
+
+        <footer className="public-footer">
+          <span>OpenCode Observatory · public analytics</span>
+          <span>
+            {mode === "live"
+              ? "Allowlisted aggregates only · account, credential, and machine identities are never exposed."
+              : "Synthetic sample workspace · every name and number is fictional and read-only."}
+          </span>
+        </footer>
+      </main>
     </div>
   );
 }

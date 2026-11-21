@@ -155,29 +155,7 @@ export function LiveDashboard({ onOpenSample }: { onOpenSample: () => void }) {
 
   return (
     <div className="public-dashboard">
-      <section className="public-hero">
-        <div>
-          <div className="eyebrow">PUBLIC AGGREGATE</div>
-          <h1>Live usage, without private identities.</h1>
-          <p>
-            A rolling seven-day view of allowlisted model and provider totals. No accounts, credentials, machines, sessions, prompts, or responses
-            are exposed.
-          </p>
-        </div>
-        <div className="public-window-card">
-          <span className="public-live-dot" />
-          <div>
-            <strong>{bucketLabel(currentWindow.bucket)} aggregates</strong>
-            <small>
-              {new Date(currentWindow.from).toLocaleString()} → {new Date(currentWindow.to).toLocaleString()}
-            </small>
-            <small>{updatedAt ? `Last loaded ${new Date(updatedAt).toLocaleTimeString()}` : "Waiting for the live endpoint"}</small>
-            <small>{range === "custom" ? "Custom ranges refresh on demand" : "Rolling windows refresh automatically every minute"}</small>
-          </div>
-        </div>
-      </section>
-
-      <section className="public-filterbar" aria-label="Live aggregate filters">
+      <section className="filters public-filterbar" aria-label="Live aggregate filters">
         <Filter size={16} />
         <label className="filter">
           <span>Timeframe</span>
@@ -247,8 +225,14 @@ export function LiveDashboard({ onOpenSample }: { onOpenSample: () => void }) {
         </div>
       )}
       <div className="public-window-note">
-        <CalendarRange size={13} /> Times are local. The last seven days are available in completed hours; custom boundaries round inward to whole hours.
-        {" "}{range === "custom" ? "Custom ranges refresh when you apply or request them." : "Rolling windows refresh automatically every minute."}
+        <CalendarRange size={13} />
+        <strong>{bucketLabel(currentWindow.bucket)} aggregates</strong>
+        <span>
+          {new Date(currentWindow.from).toLocaleString()} → {new Date(currentWindow.to).toLocaleString()}
+        </span>
+        <span>{updatedAt ? `· Last loaded ${new Date(updatedAt).toLocaleTimeString()}` : "· Waiting for the live endpoint"}</span>
+        <span>· {range === "custom" ? "Custom ranges refresh on demand" : "Rolling windows refresh automatically every minute"}</span>
+        <span>· Times are local; completed hours only.</span>
       </div>
 
       <div className="analytics-controls">

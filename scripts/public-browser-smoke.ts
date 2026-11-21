@@ -18,9 +18,11 @@ try {
     status: 404, contentType: "application/json", body: JSON.stringify({ error: "Not found" }),
   }));
   await page.goto(new URL("/public", url).toString());
+  await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
+  await expect(page.locator(".sidebar")).toBeVisible();
   await expect(page.getByText("Live public analytics are disabled")).toBeVisible();
   await page.getByRole("button", { name: /Synthetic sample/ }).click();
-  await expect(page.locator(".public-boundary").getByText("SYNTHETIC SAMPLE WORKSPACE", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Synthetic sample workspace" })).toBeVisible();
   await page.getByRole("button", { name: "Cache reads", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Usage over time" })).toBeVisible();
   await page.getByLabel("Machine", { exact: true }).selectOption("machine-studio");

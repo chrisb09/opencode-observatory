@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChartNoAxesCombined,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
   Filter,
   FlaskConical,
-  LayoutDashboard,
   Layers,
   Monitor,
   Paperclip,
@@ -37,7 +37,7 @@ import {
 } from "./sampleData";
 import type { Grouping, PublicMetric } from "./types";
 
-type SampleView = "overview" | "accounts" | "machines" | "sessions" | "requests" | "errors" | "tools" | "attachments";
+export type SampleView = "overview" | "accounts" | "machines" | "sessions" | "requests" | "errors" | "tools" | "attachments";
 type Selected =
   | { kind: "session"; value: SampleSession }
   | { kind: "account"; value: SampleAccountRow }
@@ -47,8 +47,8 @@ type Selected =
   | { kind: "tool"; value: SampleTool }
   | { kind: "attachment"; value: SampleAttachment };
 
-const nav: { id: SampleView; label: string; icon: any }[] = [
-  { id: "overview", label: "Overview", icon: LayoutDashboard },
+export const sampleViews: { id: SampleView; label: string; icon: any }[] = [
+  { id: "overview", label: "Overview", icon: ChartNoAxesCombined },
   { id: "accounts", label: "Accounts & keys", icon: Users },
   { id: "machines", label: "Machines", icon: Monitor },
   { id: "sessions", label: "Sessions", icon: Layers },
@@ -106,14 +106,7 @@ function Row({ children, onOpen, className = "" }: { children: React.ReactNode; 
     </tr>
   );
 }
-
-function sampleTableProps(page: number) {
-  const start = page * PAGE;
-  return { start, end: start + PAGE };
-}
-
-export function SampleWorkspace() {
-  const [view, setView] = useState<SampleView>("overview");
+export function SampleWorkspace({ view }: { view: SampleView }) {
   const [grouping, setGrouping] = useState<Grouping>("model");
   const [metric, setMetric] = useState<PublicMetric>("total_tokens");
   const [provider, setProvider] = useState("");
@@ -133,12 +126,10 @@ export function SampleWorkspace() {
   };
   const open = (value: Selected) => setSelected(value);
   const close = useCallback(() => setSelected(null), []);
-  const go = (id: SampleView) => {
-    setView(id);
+  useEffect(() => {
     setPage(0);
     setSelected(null);
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
+  }, [view]);
   const reset = () => {
     setProvider("");
     setModel("");
@@ -230,37 +221,16 @@ export function SampleWorkspace() {
   }, [sessionIds, provider, model, machine, machineLabel, status, search]);
 
   const paged = <T,>(rows: T[]) => rows.slice(page * PAGE, page * PAGE + PAGE);
-  const packageA = sampleTableProps(page);
 
   return (
-    <div className="sample-workspace" role="region" aria-label="Synthetic sample workspace">
-      <div className="sample-banner" role="note">
-        <FlaskConical size={16} />
-        <strong>SYNTHETIC SAMPLE WORKSPACE</strong>
-        <span>
-          {SAMPLE_LABEL} · fictional providers, accounts, machines, sessions, and costs. Read-only; nothing is sent, saved, or connected to live
-          analytics.
-        </span>
+    <div className="sample-workspace public-dashboard" role="region" aria-label="Synthetic sample workspace">
+      <div className="sample-context-note" role="note">
+        <FlaskConical size={13} />
+        <strong>Synthetic sample workspace</strong>
+        <span>{SAMPLE_LABEL} · fictional data, read-only · never fetched from, mixed with, or written to live analytics.</span>
       </div>
 
-      <section className="public-hero sample-hero">
-        <div>
-          <div className="eyebrow">DEMONSTRATION MODE · FICTIONAL DATA</div>
-          <h1>A complete workspace, clearly not live.</h1>
-          <p>
-            Explore how detailed accounts, machines, sessions, request attempts, errors, tools, and attachments could be presented. Every row and
-            number on this page is generated sample data.
-          </p>
-        </div>
-        <div className="sample-hero-card">
-          <FlaskConical size={22} />
-          <strong>Sample period</strong>
-          <span>{SAMPLE_LABEL}</span>
-          <small>{sampleSessions.length} sessions · {sampleAttempts.length} attempts · {sampleTools.length} tools · {sampleAttachments.length} attachments</small>
-        </div>
-      </section>
-
-      <section className="public-filterbar sample-filterbar" aria-label="Synthetic sample filters">
+      <section className="filters public-filterbar sample-filterbar" aria-label="Synthetic sample filters">
         <Filter size={16} />
         <strong className="sample-filter-label">Sample filters</strong>
         <label className="filter"><span>Provider</span><select value={provider} onChange={event => selectProvider(event.target.value)}><option value="">All sample providers</option>{[...new Set(sampleModels.map(item => item.provider))].map(value => <option key={value} value={value}>{value}</option>)}</select></label>
@@ -271,29 +241,7 @@ export function SampleWorkspace() {
         <button className="text-button" onClick={reset}><RefreshCw size={13} /> Reset sample filters</button>
       </section>
 
-      <div className="sample-layout">
-        <nav className="sample-nav" aria-label="Synthetic sample sections">
-          <div className="sample-nav-title">SAMPLE VIEWS</div>
-          {nav.map(item => (
-            <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}>
-              <item.icon size={16} />
-              {item.label}
-              {view === item.id && <span className="nav-dot" />}
-            </button>
-          ))}
-          <div className="sample-readonly">Read-only demonstration<br /><small>No export · no settings · no mutations</small></div>
-        </nav>
-
-        <div className="sample-content">
-          <div className="sample-view-heading">
-            <div>
-              <div className="eyebrow">SAMPLE · {nav.find(item => item.id === view)?.label.toUpperCase()}</div>
-              <h2>{nav.find(item => item.id === view)?.label}</h2>
-            </div>
-            <span className="sample-chip"><FlaskConical size={12} /> Synthetic</span>
-          </div>
-
-          {view === "overview" && (
+      {view === "overview" && (
             <>
               <div className="analytics-controls">
                 <div className="control-group"><span>Group by</span><div className="segmented">{(['model', 'provider'] as const).map(value => <button key={value} aria-pressed={grouping === value} className={grouping === value ? "chosen" : ""} onClick={() => setGrouping(value)}>{value === "model" ? "Models" : "Providers"}</button>)}</div></div>
@@ -376,8 +324,6 @@ export function SampleWorkspace() {
             <FlaskConical size={13} /> Synthetic sample workspace · fictional names and measurements · fixed period {SAMPLE_LABEL}. No request is sent
             to the public analytics endpoint.
           </div>
-        </div>
-      </div>
 
       {selected && <SampleDrawer selected={selected} close={close} />}
     </div>
