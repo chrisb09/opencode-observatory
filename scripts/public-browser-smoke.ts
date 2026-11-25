@@ -29,6 +29,9 @@ try {
   await page.getByLabel("Machine", { exact: true }).selectOption("machine-studio");
   await page.getByRole("button", { name: "Request attempts", exact: true }).click();
   await expect(page.locator("tbody tr").first()).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Request attempts", exact: true, level: 1 })).toBeVisible();
+  await expect(page.getByLabel("Machine", { exact: true })).toHaveValue("machine-studio");
   await page.getByRole("button", { name: "Tool executions", exact: true }).click();
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("button", { name: "Reset sample filters" }).click();

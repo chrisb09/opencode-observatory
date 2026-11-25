@@ -106,16 +106,80 @@ function Row({ children, onOpen, className = "" }: { children: React.ReactNode; 
     </tr>
   );
 }
+const validSampleMetrics = new Set<PublicMetric>(publicMetrics.map(([key]) => key));
+function parseSampleUrl() {
+  const p = new URLSearchParams(location.search);
+  const grouping: Grouping = p.get("groupBy") === "provider" ? "provider" : "model";
+  const m = p.get("metric") as PublicMetric | null;
+  const metric: PublicMetric = m && validSampleMetrics.has(m) ? m : "total_tokens";
+  const provider = p.get("provider") ?? "";
+  const model = p.get("model") ?? "";
+  const machine = p.get("machine") ?? "";
+  const status = p.get("status") ?? "";
+  const search = p.get("q") ?? "";
+  const rawPage = Number(p.get("page"));
+  const page = Number.isInteger(rawPage) && rawPage > 1 ? rawPage - 1 : 0;
+  const sortBy = p.get("sortBy") || "calls";
+  const sortDir: "asc" | "desc" = p.get("sortDir") === "asc" ? "asc" : "desc";
+  return { grouping, metric, provider, model, machine, status, search, page, sort: { key: sortBy, dir: sortDir } };
+}
+function buildSampleUrl(s: { view: SampleView; grouping: Grouping; metric: PublicMetric; provider: string; model: string; machine: string; status: string; search: string; page: number; sort: { key: string; dir: "asc" | "desc" } }) {
+  const p = new URLSearchParams();
+  if (s.view === "overview" && s.grouping !== "model") p.set("groupBy", s.grouping);
+  if (s.view === "overview" && s.metric !== "total_tokens") p.set("metric", s.metric);
+  if (s.provider) p.set("provider", s.provider);
+  if (s.model) p.set("model", s.model);
+  if (s.machine) p.set("machine", s.machine);
+  if (s.status) p.set("status", s.status);
+  if (s.search) p.set("q", s.search);
+  if (s.view !== "overview" && s.page > 0) p.set("page", String(s.page + 1));
+  if (s.view === "overview" && (s.sort.key !== "calls" || s.sort.dir !== "desc")) {
+    p.set("sortBy", s.sort.key);
+    p.set("sortDir", s.sort.dir);
+  }
+  const qs = p.toString();
+  return qs ? `${location.pathname}?${qs}` : location.pathname;
+}
+
 export function SampleWorkspace({ view }: { view: SampleView }) {
-  const [grouping, setGrouping] = useState<Grouping>("model");
-  const [metric, setMetric] = useState<PublicMetric>("total_tokens");
-  const [provider, setProvider] = useState("");
-  const [model, setModel] = useState("");
-  const [machine, setMachine] = useState("");
-  const [status, setStatus] = useState("");
-  const [search, setSearch] = useState("");
-  const [page, setPage] = useState(0);
+  const initial = useMemo(() => parseSampleUrl(), []);
+  const [grouping, setGrouping] = useState<Grouping>(initial.grouping);
+  const [metric, setMetric] = useState<PublicMetric>(initial.metric);
+  const [provider, setProvider] = useState(initial.provider);
+  const [model, setModel] = useState(initial.model);
+  const [machine, setMachine] = useState(initial.machine);
+  const [status, setStatus] = useState(initial.status);
+  const [search, setSearch] = useState(initial.search);
+  const [page, setPage] = useState(initial.page);
+  const [sort, setSort] = useState<{ key: string; dir: "asc" | "desc" }>(initial.sort);
   const [selected, setSelected] = useState<Selected | null>(null);
+  const fromPop = useRef(false);
+  const prevView = useRef(view);
+
+  useEffect(() => {
+    if (fromPop.current) { fromPop.current = false; return; }
+    const next = buildSampleUrl({ view, grouping, metric, provider, model, machine, status, search, page, sort });
+    if (next !== location.pathname + location.search) history.replaceState(null, "", next);
+  }, [view, grouping, metric, provider, model, machine, status, search, page, sort]);
+
+  useEffect(() => {
+    const onPop = () => {
+      fromPop.current = true;
+      const next = parseSampleUrl();
+      setGrouping(next.grouping);
+      setMetric(next.metric);
+      setProvider(next.provider);
+      setModel(next.model);
+      setMachine(next.machine);
+      setStatus(next.status);
+      setSearch(next.search);
+      setPage(next.page);
+      setSort(next.sort);
+      setSelected(null);
+    };
+    globalThis.addEventListener("popstate", onPop);
+    return () => globalThis.removeEventListener("popstate", onPop);
+  }, []);
 
   const modelChoices = sampleModels.filter(item => !provider || item.provider === provider);
   const machineLabel = useMemo(() => sampleMachines.find(item => item.id === machine)?.label ?? "", [machine]);
@@ -127,7 +191,10 @@ export function SampleWorkspace({ view }: { view: SampleView }) {
   const open = (value: Selected) => setSelected(value);
   const close = useCallback(() => setSelected(null), []);
   useEffect(() => {
-    setPage(0);
+    if (prevView.current !== view) {
+      prevView.current = view;
+      setPage(0);
+    }
     setSelected(null);
   }, [view]);
   const reset = () => {
@@ -253,7 +320,7 @@ export function SampleWorkspace({ view }: { view: SampleView }) {
                 <span><strong>{metricName(metric)}</strong> selected measure</span>
                 <span><strong>No live data</strong> mixed into this view</span>
               </div>
-              <AnalyticsView stats={analytics} grouping={grouping} metric={metric} kind="sample" />
+              <AnalyticsView stats={analytics} grouping={grouping} metric={metric} kind="sample" sort={sort} onSortChange={setSort} />
             </>
           )}
 

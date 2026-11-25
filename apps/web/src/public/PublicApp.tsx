@@ -6,11 +6,21 @@ import { SampleWorkspace, sampleViews, type SampleView } from "./SampleWorkspace
 import "./public.css";
 
 type Mode = "live" | "sample";
-const modeFromPath = (): Mode => (location.pathname.replace(/\/+$/, "") === "/public/sample" ? "sample" : "live");
+const validSampleViews = new Set<SampleView>(sampleViews.map(item => item.id));
+const routeFromPath = (): { mode: Mode; sampleView: SampleView } => {
+  const path = location.pathname.replace(/\/+$/, "");
+  if (path === "/public/sample") return { mode: "sample", sampleView: "overview" };
+  if (path.startsWith("/public/sample/")) {
+    const view = path.slice("/public/sample/".length) as SampleView;
+    return { mode: "sample", sampleView: validSampleViews.has(view) ? view : "overview" };
+  }
+  return { mode: "live", sampleView: "overview" };
+};
 
 export function PublicApp() {
-  const [mode, setMode] = useState<Mode>(modeFromPath);
-  const [sampleView, setSampleView] = useState<SampleView>("overview");
+  const initialRoute = routeFromPath();
+  const [mode, setMode] = useState<Mode>(initialRoute.mode);
+  const [sampleView, setSampleView] = useState<SampleView>(initialRoute.sampleView);
   const sampleViewLabel = sampleViews.find(item => item.id === sampleView)?.label ?? "Overview";
 
   useEffect(() => {
@@ -19,19 +29,28 @@ export function PublicApp() {
   }, [mode, sampleViewLabel]);
 
   useEffect(() => {
-    const sync = () => setMode(modeFromPath());
+    const sync = () => {
+      const next = routeFromPath();
+      setMode(next.mode);
+      if (next.mode === "sample") setSampleView(next.sampleView);
+    };
     window.addEventListener("popstate", sync);
     return () => window.removeEventListener("popstate", sync);
   }, []);
 
   const change = (next: Mode) => {
     if (next === mode) return;
-    history.pushState(null, "", next === "sample" ? "/public/sample" : "/public");
+    const target = next === "sample" ? (sampleView === "overview" ? "/public/sample" : `/public/sample/${sampleView}`) : "/public";
+    history.pushState(null, "", target);
     setMode(next);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const chooseSampleView = (next: SampleView) => {
+    if (next !== sampleView) {
+      const target = next === "overview" ? "/public/sample" : `/public/sample/${next}`;
+      history.pushState(null, "", `${target}${location.search}`);
+    }
     setSampleView(next);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };

@@ -1,4 +1,4 @@
-import React,{useState,useEffect,useCallback,useMemo} from "react";
+import React,{useState,useEffect,useCallback,useMemo,useRef} from "react";
 import {createRoot} from "react-dom/client";
 import {XAxis,YAxis,CartesianGrid,Tooltip,ResponsiveContainer,BarChart,Bar} from "recharts";
 import {Activity,ArrowUpRight,Boxes,ChartNoAxesCombined,Check,ChevronLeft,ChevronRight,Coins,Copy,Download,Filter,KeyRound,Layers,LogOut,Monitor,RefreshCw,Settings,ShieldCheck,Terminal,Users,X,Zap,Paperclip,DollarSign} from "lucide-react";
@@ -57,11 +57,14 @@ const views=[
   {id:"settings",name:"Settings",icon:Settings}
 ];
 
-function useSortable<T>(items:T[],defaultKey="",defaultDir:"asc"|"desc"="desc"){
-  const[key,setKey]=useState<string>(defaultKey),[dir,setDir]=useState<"asc"|"desc">(defaultDir);
+function useSortable<T>(items:T[],defaultKey="",defaultDir:"asc"|"desc"="desc",controlled?:{key:string;dir:"asc"|"desc";onChange:(key:string,dir:"asc"|"desc")=>void}){
+  const[localKey,setLocalKey]=useState<string>(defaultKey),[localDir,setLocalDir]=useState<"asc"|"desc">(defaultDir);
+  const key=controlled?controlled.key:localKey;
+  const dir=controlled?controlled.dir:localDir;
   const onSort=(newKey:string)=>{
-    if(key===newKey)setDir(d=>d==="asc"?"desc":"asc");
-    else{setKey(newKey);setDir("desc");}
+    const nextDir=key===newKey?(dir==="asc"?"desc":"asc"):"desc";
+    if(controlled)controlled.onChange(newKey,nextDir);
+    else{setLocalKey(newKey);setLocalDir(nextDir);}
   };
   const sorted=useMemo(()=>{
     if(!key)return items;
@@ -99,17 +102,76 @@ function Th({label,sortKey,currentKey,dir,onSort,width,align="left"}:any){
   );
 }
 
+const VALID_VIEWS=new Set(views.map(v=>v.id));
+const VALID_RANGES=new Set(["1","7","30","90","all","custom"]);
+const VALID_METRICS=new Set(usageMetrics.map(([k])=>k));
+function parsePrivateUrl(){
+  const path=location.pathname.replace(/^\/+|\/+$/g,"");
+  const view=path&&VALID_VIEWS.has(path)?path:"overview";
+  const p=new URLSearchParams(location.search);
+  const range=VALID_RANGES.has(p.get("range")??"")?p.get("range")!:"7";
+  const customFrom=range==="custom"?(p.get("from")??""):"";
+  const customTo=range==="custom"?(p.get("to")??""):"";
+  const provider=p.get("provider")??"";
+  const model=p.get("model")??"";
+  const account=p.get("account")??"";
+  const credential=p.get("credential")??"";
+  const machine=p.get("machine")??"";
+  const status=p.get("status")??"";
+  const gb=p.get("groupBy");
+  const accountGrouping:( "provider"|"account"|"credential")=(gb==="provider"||gb==="account"||gb==="credential")?gb:"account";
+  const modelGrouping:("model"|"provider")=(gb==="provider"||gb==="model")?gb:"model";
+  const m=p.get("metric");
+  const metric:UsageMetric=m&&VALID_METRICS.has(m as UsageMetric)?(m as UsageMetric):"total_tokens";
+  const sessionId=p.get("sessionId")??"";
+  const installationId=p.get("installationId")??"";
+  const session:Entity|null=(view==="sessions"&&sessionId&&installationId)?{entity_id:sessionId,installation_id:installationId,machine:"",session_id:sessionId,message_id:"",observed_at:"",historical:false,runtime:null,data:{}}:null;
+  const isAnalytics=["overview","models","accounts","machines"].includes(view);
+  const defaultSortKey=isAnalytics?"calls":view==="errors"?"occurrences":"observed_at";
+  const sortBy=p.get("sortBy")||defaultSortKey;
+  const sortDir:"asc"|"desc"=p.get("sortDir")==="asc"?"asc":"desc";
+  const rawPage=Number(p.get("page"));
+  const page=Number.isInteger(rawPage)&&rawPage>1?rawPage-1:0;
+  return {view,range,customFrom,customTo,provider,model,account,credential,machine,status,accountGrouping,modelGrouping,metric,session,analyticsSort:isAnalytics?{key:sortBy,dir:sortDir}:{key:"calls",dir:"desc" as const},serverSort:!isAnalytics?{key:sortBy,dir:sortDir}:{key:view==="errors"?"occurrences":"observed_at",dir:"desc" as const},page};
+}
+function buildPrivateUrl(s:{view:string;range:string;customFrom:string;customTo:string;provider:string;model:string;account:string;credential:string;machine:string;status:string;accountGrouping:"provider"|"account"|"credential";modelGrouping:"model"|"provider";metric:UsageMetric;session:Entity|null;analyticsSort:{key:string;dir:"asc"|"desc"};serverSort:{key:string;dir:"asc"|"desc"};page:number}){
+  const path=s.view==="overview"?"/":`/${s.view}`;
+  const p=new URLSearchParams();
+  if(s.range!=="7")p.set("range",s.range);
+  if(s.range==="custom"){if(s.customFrom)p.set("from",s.customFrom);if(s.customTo)p.set("to",s.customTo);}
+  if(s.provider)p.set("provider",s.provider);
+  if(s.model)p.set("model",s.model);
+  if(s.account)p.set("account",s.account);
+  if(s.credential)p.set("credential",s.credential);
+  if(s.machine)p.set("machine",s.machine);
+  if(s.status&&s.view==="requests")p.set("status",s.status);
+  if(s.view==="models"&&s.modelGrouping!=="model")p.set("groupBy",s.modelGrouping);
+  if(s.view==="accounts"&&s.accountGrouping!=="account")p.set("groupBy",s.accountGrouping);
+  if(s.metric!=="total_tokens"&&["overview","models","accounts","machines"].includes(s.view))p.set("metric",s.metric);
+  if(s.session){p.set("sessionId",s.session.entity_id);p.set("installationId",s.session.installation_id);}
+  const isAnalytics=["overview","models","accounts","machines"].includes(s.view);
+  const sort=isAnalytics?s.analyticsSort:s.serverSort;
+  const defaultKey=isAnalytics?"calls":s.view==="errors"?"occurrences":"observed_at";
+  if(s.view!=="settings"&&(sort.key!==defaultKey||sort.dir!=="desc")){p.set("sortBy",sort.key);p.set("sortDir",sort.dir);}
+  if(s.page>0&&!isAnalytics&&s.view!=="settings")p.set("page",String(s.page+1));
+  const qs=p.toString();
+  return qs?`${path}?${qs}`:path;
+}
+
 function App(){
-  const[user,setUser]=useState<User|null>(null),[checking,setChecking]=useState(true),[view,setView]=useState("overview"),[error,setError]=useState(""),[busy,setBusy]=useState(false);
-  const[range,setRange]=useState("7"),[provider,setProvider]=useState(""),[model,setModel]=useState(""),[account,setAccount]=useState(""),[credential,setCredential]=useState(""),[machine,setMachine]=useState(""),[status,setStatus]=useState(""),[customFrom,setCustomFrom]=useState(""),[customTo,setCustomTo]=useState("");
-  const[accountGrouping,setAccountGrouping]=useState<"provider"|"account"|"credential">("account");
-  const[modelGrouping,setModelGrouping]=useState<"model"|"provider">("model"),[metric,setMetric]=useState<UsageMetric>("total_tokens");
+  const initial=useMemo(()=>parsePrivateUrl(),[]);
+  const[user,setUser]=useState<User|null>(null),[checking,setChecking]=useState(true),[view,setView]=useState(initial.view),[error,setError]=useState(""),[busy,setBusy]=useState(false);
+  const[range,setRange]=useState(initial.range),[provider,setProvider]=useState(initial.provider),[model,setModel]=useState(initial.model),[account,setAccount]=useState(initial.account),[credential,setCredential]=useState(initial.credential),[machine,setMachine]=useState(initial.machine),[status,setStatus]=useState(initial.status),[customFrom,setCustomFrom]=useState(initial.customFrom),[customTo,setCustomTo]=useState(initial.customTo);
+  const[accountGrouping,setAccountGrouping]=useState<"provider"|"account"|"credential">(initial.accountGrouping);
+  const[modelGrouping,setModelGrouping]=useState<"model"|"provider">(initial.modelGrouping),[metric,setMetric]=useState<UsageMetric>(initial.metric);
   const[machineInventory,setMachineInventory]=useState<any[]>([]);
   const grouping=view==="accounts"?accountGrouping:view==="machines"?"machine":view==="models"?modelGrouping:"model";
-  const[serverSort,setServerSort]=useState({key:"observed_at",dir:"desc" as "asc"|"desc"});
-  const[dimensions,setDimensions]=useState<any[]>([]),[stats,setStats]=useState<any>(null),[rows,setRows]=useState<Entity[]>([]),[total,setTotal]=useState(0),[page,setPage]=useState(0),[tick,setTick]=useState(0),[selected,setSelected]=useState<Entity|null>(null),[session,setSession]=useState<Entity|null>(null);
+  const[serverSort,setServerSort]=useState(initial.serverSort);
+  const[analyticsSort,setAnalyticsSort]=useState(initial.analyticsSort);
+  const[dimensions,setDimensions]=useState<any[]>([]),[stats,setStats]=useState<any>(null),[rows,setRows]=useState<Entity[]>([]),[total,setTotal]=useState(0),[page,setPage]=useState(initial.page),[tick,setTick]=useState(0),[selected,setSelected]=useState<Entity|null>(null),[session,setSession]=useState<Entity|null>(initial.session);
   const[loadedAt,setLoadedAt]=useState<number|null>(null),[listingStats,setListingStats]=useState<any>(null);
   const[coverage,setCoverage]=useState<any>(null),[memory,setMemory]=useState<any>(null);
+  const pushNav=useRef(false),fromPop=useRef(false);
 
   useEffect(()=>{request("/api/auth/me").then(setUser).catch(()=>{}).finally(()=>setChecking(false));},[]);
   useEffect(()=>{if(user)request("/api/dimensions").then(setDimensions).catch(e=>setError(e.message));},[user,tick]);
@@ -146,7 +208,32 @@ function App(){
     return()=>abort.abort();
   },[user,view,query,tick,session]);
 
-  const navigate=(id:string)=>{setView(id);setPage(0);setSession(null);setSelected(null);setListingStats(null);setStatus("");setError("");setServerSort({key:id==="errors"?"occurrences":"observed_at",dir:"desc"});window.scrollTo({top:0});};
+  useEffect(()=>{
+    if(!user)return;
+    if(fromPop.current){fromPop.current=false;return;}
+    const next=buildPrivateUrl({view,range,customFrom,customTo,provider,model,account,credential,machine,status,accountGrouping,modelGrouping,metric,session,analyticsSort,serverSort,page});
+    const current=location.pathname+location.search;
+    if(next!==current){
+      if(pushNav.current)history.pushState(null,"",next);
+      else history.replaceState(null,"",next);
+    }
+    pushNav.current=false;
+  },[user,view,range,customFrom,customTo,provider,model,account,credential,machine,status,accountGrouping,modelGrouping,metric,session,analyticsSort,serverSort,page]);
+  useEffect(()=>{
+    const onPop=()=>{
+      fromPop.current=true;
+      const s=parsePrivateUrl();
+      setView(s.view);setRange(s.range);setCustomFrom(s.customFrom);setCustomTo(s.customTo);
+      setProvider(s.provider);setModel(s.model);setAccount(s.account);setCredential(s.credential);setMachine(s.machine);setStatus(s.status);
+      setAccountGrouping(s.accountGrouping);setModelGrouping(s.modelGrouping);setMetric(s.metric);
+      setSession(s.session);setAnalyticsSort(s.analyticsSort);setServerSort(s.serverSort);setPage(s.page);
+      setSelected(null);setError("");
+    };
+    window.addEventListener("popstate",onPop);
+    return()=>window.removeEventListener("popstate",onPop);
+  },[]);
+
+  const navigate=(id:string)=>{pushNav.current=true;setView(id);setPage(0);setSession(null);setSelected(null);setListingStats(null);setStatus("");setError("");setServerSort({key:id==="errors"?"occurrences":"observed_at",dir:"desc"});setAnalyticsSort({key:"calls",dir:"desc"});window.scrollTo({top:0});};
   const reset=()=>{setProvider("");setModel("");setAccount("");setCredential("");setMachine("");setStatus("");setPage(0);};
   const refresh=()=>{clearClientCache();setTick(x=>x+1);};
   const logout=async()=>{await request("/api/auth/logout",{});clearClientCache();setUser(null);setStats(null);setRows([]);setSelected(null);setDimensions([]);setMachineInventory([]);};
@@ -163,8 +250,8 @@ function App(){
       return {id:name,label:name,calls:0,total_tokens:0,cost:0,market_cost:0,...groups.find((g:any)=>g.id===name),inventories,last_seen:inventories.length?Math.max(...inventories.map(i=>Number(i.last_seen))):null};
     });
   },[groups,machineInventory,provider,model,account,credential,machine]);
-  const machinesSort=useSortable(machineData,"calls","desc");
-  const groupsSort=useSortable(groups,"calls","desc");
+  const machinesSort=useSortable(machineData,"calls","desc",{key:analyticsSort.key,dir:analyticsSort.dir,onChange:(key,dir)=>setAnalyticsSort({key,dir})});
+  const groupsSort=useSortable(groups,"calls","desc",{key:analyticsSort.key,dir:analyticsSort.dir,onChange:(key,dir)=>setAnalyticsSort({key,dir})});
   const rowsSort={sorted:rows,key:serverSort.key,dir:serverSort.dir,onSort:(key:string)=>{setServerSort(old=>({key,dir:old.key===key&&old.dir==="desc"?"asc":"desc"}));setPage(0);}};
 
   if(checking)return <div className="auth"><div className="brand"><Activity/> Observatory</div><p>Connecting to your observatory…</p></div>;
@@ -302,7 +389,7 @@ function App(){
 
       {view==="requests"&&listingStats&&<><div className="health-grid"><Mini label="Observed HTTP attempts" value={n(listingStats.attempts)}/><Mini label="Completed / running" value={`${n(listingStats.completed)} / ${n(listingStats.running)}`}/><Mini label="Failed / cancelled" value={`${n(listingStats.failed)} / ${n(listingStats.cancelled)}`}/><Mini label="Median / p95 duration" value={`${ms(listingStats.p50_ms)} / ${ms(listingStats.p95_ms)}`}/><Mini label="Median first output" value={ms(listingStats.first_output_ms)}/><Mini label="Measured token usage" value={`${n(listingStats.known_usage)} / ${n(listingStats.attempts)} attempts`}/></div><div className="coverage-note"><p>These are observed HTTP attempts, including retries. Historical imports contain model calls, not individual HTTP attempts. Usage comes from provider counters or uniquely matched lifecycle steps, labeled in Source. Missing and ambiguous measurements stay unavailable.</p></div></>}
       {(["requests","tools","attachments"].includes(view)||session)&&<section className="panel">
-        {session&&<button className="button subtle back" onClick={()=>{setSession(null);setPage(0);}}><ChevronLeft size={16}/>All sessions</button>}
+        {session&&<button className="button subtle back" onClick={()=>{pushNav.current=true;setSession(null);setPage(0);}}><ChevronLeft size={16}/>All sessions</button>}
         <div className="panel-title"><div><h2>{session?"Model steps":current.name}</h2><p>{n(total)} records · Click column headers to sort or click a row to inspect</p></div><span className="badge neutral">Metadata</span></div>
         <div className="table-wrap"><table><thead><tr>
           <Th label={view==="tools"?"Tool":view==="attachments"?"MIME type":"Model / session"} sortKey={view==="tools"?"tool":view==="attachments"?"mime":"model"} currentKey={rowsSort.key} dir={rowsSort.dir} onSort={rowsSort.onSort}/>
@@ -369,7 +456,7 @@ function App(){
       <footer>OpenCode Observatory <span>{loadedAt?`Updated ${new Date(loadedAt).toLocaleTimeString()}`:"Your private AI usage workspace"}</span></footer>
     </main>
 
-    {selected&&<div className="overlay" onClick={()=>setSelected(null)}><section className="drawer" role="dialog" aria-modal="true" aria-label="Record metadata" onClick={e=>e.stopPropagation()}><button className="icon close" aria-label="Close details" onClick={()=>setSelected(null)}><X/></button><div className="eyebrow">RECORD INSPECTOR</div><h2>{selected.data.title??selected.data.model??selected.data.tool??short(selected.entity_id)}</h2><p className="mono">{selected.entity_id}</p>{view==="sessions"&&!session&&<button className="button primary" onClick={()=>{setSession(selected);setSelected(null);setPage(0);}}>Explore model steps<ArrowUpRight size={16}/></button>}{memory&&view==="sessions"&&!session&&<MemoryDetail memory={memory}/>}<h3>Metadata</h3><dl>{Object.entries(selected.data).map(([k,v])=><div key={k}><dt>{k.replace(/([A-Z])/g," $1")}</dt><dd>{v==null?"Unavailable":["cost","marketCost","cacheSavings"].includes(k)?money(v):String(v)}</dd></div>)}</dl><h3>Runtime at capture</h3><VersionInventory runtime={selected.runtime}/>{selected.historical&&<div className="notice">Historical request/plugin versions were not recorded by OpenCode. The import-time inventory is not evidence of versions used for these requests.</div>}</section></div>}
+    {selected&&<div className="overlay" onClick={()=>setSelected(null)}><section className="drawer" role="dialog" aria-modal="true" aria-label="Record metadata" onClick={e=>e.stopPropagation()}><button className="icon close" aria-label="Close details" onClick={()=>setSelected(null)}><X/></button><div className="eyebrow">RECORD INSPECTOR</div><h2>{selected.data.title??selected.data.model??selected.data.tool??short(selected.entity_id)}</h2><p className="mono">{selected.entity_id}</p>{view==="sessions"&&!session&&<button className="button primary" onClick={()=>{pushNav.current=true;setSession(selected);setSelected(null);setPage(0);}}>Explore model steps<ArrowUpRight size={16}/></button>}{memory&&view==="sessions"&&!session&&<MemoryDetail memory={memory}/>}<h3>Metadata</h3><dl>{Object.entries(selected.data).map(([k,v])=><div key={k}><dt>{k.replace(/([A-Z])/g," $1")}</dt><dd>{v==null?"Unavailable":["cost","marketCost","cacheSavings"].includes(k)?money(v):String(v)}</dd></div>)}</dl><h3>Runtime at capture</h3><VersionInventory runtime={selected.runtime}/>{selected.historical&&<div className="notice">Historical request/plugin versions were not recorded by OpenCode. The import-time inventory is not evidence of versions used for these requests.</div>}</section></div>}
   </div>;
 }
 

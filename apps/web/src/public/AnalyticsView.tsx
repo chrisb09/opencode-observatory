@@ -170,12 +170,26 @@ const columns: [string, string][] = [
   ["market_cost", "Market rate"],
 ];
 
-function Breakdown({ stats, grouping }: { stats: PublicAnalytics; grouping: Grouping }) {
+function Breakdown({
+  stats,
+  grouping,
+  sort: controlledSort,
+  onSortChange,
+}: {
+  stats: PublicAnalytics;
+  grouping: Grouping;
+  sort?: { key: string; dir: "asc" | "desc" };
+  onSortChange?: (sort: { key: string; dir: "asc" | "desc" }) => void;
+}) {
   const groups = grouping === "provider" ? stats.providerGroups : stats.modelGroups;
-  const [sort, setSort] = useState<{ key: string; dir: "asc" | "desc" }>({ key: "calls", dir: "desc" });
+  const [localSort, setLocalSort] = useState<{ key: string; dir: "asc" | "desc" }>({ key: "calls", dir: "desc" });
+  const sort = controlledSort ?? localSort;
   const sorted = useMemo(() => sortGroups(groups, sort.key, sort.dir), [groups, sort]);
-  const toggle = (key: string) =>
-    setSort(previous => ({ key, dir: previous.key === key && previous.dir === "desc" ? "asc" : "desc" }));
+  const toggle = (key: string) => {
+    const next = { key, dir: (sort.key === key && sort.dir === "desc" ? "asc" : "desc") as "asc" | "desc" };
+    if (onSortChange) onSortChange(next);
+    else setLocalSort(next);
+  };
   return (
     <section className="panel public-breakdown">
       <div className="panel-title">
@@ -238,12 +252,16 @@ export function AnalyticsView({
   metric,
   kind,
   pending = false,
+  sort,
+  onSortChange,
 }: {
   stats: PublicAnalytics;
   grouping: Grouping;
   metric: PublicMetric;
   kind: "live" | "sample";
   pending?: boolean;
+  sort?: { key: string; dir: "asc" | "desc" };
+  onSortChange?: (sort: { key: string; dir: "asc" | "desc" }) => void;
 }) {
   const groups = grouping === "provider" ? stats.providerGroups : stats.modelGroups;
   const colors = useMemo(() => groupColors(groups, grouping, kind === "sample" ? stats.modelGroups : stats.modelGroups), [groups, grouping, stats.modelGroups]);
@@ -317,7 +335,7 @@ export function AnalyticsView({
         <Mini label="Failed / cancelled attempts" value={`${count(transport?.failed)} / ${count(transport?.cancelled)}`} />
         <Mini label="Observed HTTP attempts" value={count(transport?.attempts)} />
       </div>
-      <Breakdown stats={stats} grouping={grouping} />
+      <Breakdown stats={stats} grouping={grouping} sort={sort} onSortChange={onSortChange} />
       <p className="footnote">
         Total tokens include cached prompt tokens and completion including reasoning, without adding overlapping categories twice. Unknown pricing stays
         unavailable. Market value excludes subscription fees and is not an invoice. {kind === "live" ? "Aggregates are allowlisted; account, credential, machine, and session identities are never exposed." : "Synthetic sample values are fictional and unrelated to any live workspace."}

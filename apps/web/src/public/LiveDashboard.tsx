@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CalendarRange, Filter, LockKeyhole, RefreshCw, RotateCcw, ShieldCheck, WifiOff } from "lucide-react";
 import { AnalyticsSkeleton, AnalyticsView, bucketLabel, publicMetrics } from "./AnalyticsView";
 import { fetchPublicAnalytics, PublicApiError } from "./api";
@@ -25,16 +25,61 @@ const rangeText = (range: RangeKey) =>
   range === "24h" ? "Last 24 hours" : range === "48h" ? "Last 48 hours" : range === "7d" ? "Last 7 days" : "Custom range";
 const amount = (value: number | null) => (value == null ? "—" : value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} s`);
 
+const validRanges = new Set<RangeKey>(["24h", "48h", "7d", "custom"]);
+const validMetrics = new Set<PublicMetric>(publicMetrics.map(([key]) => key));
+function parseLiveUrl() {
+  const p = new URLSearchParams(location.search);
+  const rawRange = p.get("range") as RangeKey | null;
+  let range: RangeKey = rawRange && validRanges.has(rawRange) ? rawRange : "7d";
+  let window = rolling(range === "custom" ? "7d" : range);
+  if (range === "custom") {
+    const from = Number(p.get("from")), to = Number(p.get("to")), now = Date.now();
+    if (Number.isFinite(from) && Number.isFinite(to) && to > from && from >= now - WEEK && to <= now + 60000) {
+      window = { from, to };
+    } else {
+      range = "7d";
+    }
+  }
+  const grouping: Grouping = p.get("groupBy") === "provider" ? "provider" : "model";
+  const m = p.get("metric") as PublicMetric | null;
+  const metric: PublicMetric = m && validMetrics.has(m) ? m : "total_tokens";
+  const provider = p.get("provider") ?? "";
+  const model = p.get("model") ?? "";
+  const sortBy = p.get("sortBy") || "calls";
+  const sortDir: "asc" | "desc" = p.get("sortDir") === "asc" ? "asc" : "desc";
+  return { range, window, customFrom: inputValue(window.from), customTo: inputValue(window.to), grouping, metric, provider, model, sort: { key: sortBy, dir: sortDir } };
+}
+function buildLiveUrl(s: { range: RangeKey; window: Window; grouping: Grouping; metric: PublicMetric; provider: string; model: string; sort: { key: string; dir: "asc" | "desc" } }) {
+  const p = new URLSearchParams();
+  if (s.range !== "7d") p.set("range", s.range);
+  if (s.range === "custom") {
+    p.set("from", String(s.window.from));
+    p.set("to", String(s.window.to));
+  }
+  if (s.grouping !== "model") p.set("groupBy", s.grouping);
+  if (s.metric !== "total_tokens") p.set("metric", s.metric);
+  if (s.provider) p.set("provider", s.provider);
+  if (s.model) p.set("model", s.model);
+  if (s.sort.key !== "calls" || s.sort.dir !== "desc") {
+    p.set("sortBy", s.sort.key);
+    p.set("sortDir", s.sort.dir);
+  }
+  const qs = p.toString();
+  return qs ? `${location.pathname}?${qs}` : location.pathname;
+}
+
 export function LiveDashboard({ onOpenSample }: { onOpenSample: () => void }) {
-  const [range, setRange] = useState<RangeKey>("7d");
-  const [window, setWindow] = useState<Window>(() => rolling("7d"));
-  const [customFrom, setCustomFrom] = useState(() => inputValue(rolling("7d").from));
-  const [customTo, setCustomTo] = useState(() => inputValue(Date.now()));
+  const initial = useMemo(() => parseLiveUrl(), []);
+  const [range, setRange] = useState<RangeKey>(initial.range);
+  const [window, setWindow] = useState<Window>(initial.window);
+  const [customFrom, setCustomFrom] = useState(initial.customFrom);
+  const [customTo, setCustomTo] = useState(initial.customTo);
   const [rangeError, setRangeError] = useState("");
-  const [grouping, setGrouping] = useState<Grouping>("model");
-  const [metric, setMetric] = useState<PublicMetric>("total_tokens");
-  const [provider, setProvider] = useState("");
-  const [model, setModel] = useState("");
+  const [grouping, setGrouping] = useState<Grouping>(initial.grouping);
+  const [metric, setMetric] = useState<PublicMetric>(initial.metric);
+  const [provider, setProvider] = useState(initial.provider);
+  const [model, setModel] = useState(initial.model);
+  const [sort, setSort] = useState<{ key: string; dir: "asc" | "desc" }>(initial.sort);
   const [stats, setStats] = useState<PublicAnalytics | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [providers, setProviders] = useState<string[]>([]);
@@ -42,6 +87,49 @@ export function LiveDashboard({ onOpenSample }: { onOpenSample: () => void }) {
   const [error, setError] = useState<ApiError | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [tick, setTick] = useState(0);
+  const fromPop = useRef(false);
+
+  useEffect(() => {
+    if (fromPop.current) { fromPop.current = false; return; }
+    const next = buildLiveUrl({ range, window, grouping, metric, provider, model, sort });
+    if (next !== location.pathname + location.search) history.replaceState(null, "", next);
+  }, [range, window.from, window.to, grouping, metric, provider, model, sort]);
+
+  useEffect(() => {
+    const onPop = () => {
+      fromPop.current = true;
+      const next = parseLiveUrl();
+      setRange(next.range);
+      setWindow(next.window);
+      setCustomFrom(next.customFrom);
+      setCustomTo(next.customTo);
+      setGrouping(next.grouping);
+      setMetric(next.metric);
+      setProvider(next.provider);
+      setModel(next.model);
+      setSort(next.sort);
+      setRangeError("");
+    };
+    globalThis.addEventListener("popstate", onPop);
+    return () => globalThis.removeEventListener("popstate", onPop);
+  }, []);
+
+  const applyCatalog = useCallback((value: PublicAnalytics) => {
+    setProviders([...new Set(value.providerGroups.map(group => group.id))].sort());
+    const byLabel = new Map<string, Set<string>>();
+    for (const group of value.modelGroups) {
+      const label = group.label?.trim();
+      if (!label) continue;
+      if (!byLabel.has(label)) byLabel.set(label, new Set());
+      const providerLabel = typeof group.provider === "string" ? group.provider.trim() : "";
+      if (providerLabel) byLabel.get(label)!.add(providerLabel);
+    }
+    setModels(
+      [...byLabel]
+        .map(([label, providers]) => ({ label, providers: [...providers].sort() }))
+        .sort((a, b) => a.label.localeCompare(b.label)),
+    );
+  }, []);
 
   useEffect(() => {
     const abort = new AbortController();
@@ -59,20 +147,11 @@ export function LiveDashboard({ onOpenSample }: { onOpenSample: () => void }) {
         setStats(value);
         setUpdatedAt(Date.now());
         if (!provider && !model) {
-          setProviders([...new Set(value.providerGroups.map(group => group.id))].sort());
-          const byLabel = new Map<string, Set<string>>();
-          for (const group of value.modelGroups) {
-            const label = group.label?.trim();
-            if (!label) continue;
-            if (!byLabel.has(label)) byLabel.set(label, new Set());
-            const providerLabel = typeof group.provider === "string" ? group.provider.trim() : "";
-            if (providerLabel) byLabel.get(label)!.add(providerLabel);
-          }
-          setModels(
-            [...byLabel]
-              .map(([label, providers]) => ({ label, providers: [...providers].sort() }))
-              .sort((a, b) => a.label.localeCompare(b.label)),
-          );
+          applyCatalog(value);
+        } else if (!providers.length) {
+          fetchPublicAnalytics(new URLSearchParams({ from: String(window.from), to: String(window.to), groupBy: "model" }), abort.signal)
+            .then(applyCatalog)
+            .catch(() => {});
         }
       })
       .catch(value => {
@@ -288,7 +367,7 @@ export function LiveDashboard({ onOpenSample }: { onOpenSample: () => void }) {
       )}
 
       {stats && (
-        <AnalyticsView stats={stats} grouping={grouping} metric={metric} kind="live" pending={loading} />
+        <AnalyticsView stats={stats} grouping={grouping} metric={metric} kind="live" pending={loading} sort={sort} onSortChange={setSort} />
       )}
 
       {stats && !loading && !activeGroups.length && (
