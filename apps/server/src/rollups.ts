@@ -1,15 +1,15 @@
 import type { PoolClient } from "pg";
 import type { Filters } from "@observatory/contracts";
 import { tenant } from "./db.js";
-import { usageSQL, lookups, records } from "./usage.js";
-import { usageVector, type UsageBucket, type UsageDimensions } from "./metrics.js";
+import { usageSQL, lookups, records, columns } from "./usage.js";
+import { usageVector, normalizeUsage, number, percentile, type UsageBucket, type UsageDimensions } from "./metrics.js";
 
 const hour=3600000;
 export async function lockUsage(db:PoolClient,userId:string) {
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended('observatory:usage:'||$1,0))",[userId]);
 }
 export async function usageState(db:PoolClient,userId:string) {
-  return (await db.query(`SELECT s.ready,(s.catalog_revision=v.revision AND s.format_version=2) AS current,v.revision AS catalog_version,
+  return (await db.query(`SELECT s.ready,(s.catalog_revision=v.revision AND s.format_version=3) AS current,v.revision AS catalog_version,
     EXISTS(SELECT 1 FROM usage_dirty WHERE user_id=$1) AS dirty
     FROM usage_catalog_version v LEFT JOIN usage_rollup_state s ON s.user_id=$1`,[userId])).rows[0];
 }
@@ -58,7 +58,8 @@ export async function refreshUsage(db:PoolClient,userId:string,force=false,defer
     WHERE p.installation_id=e.installation_id AND p.kind=e.kind AND p.entity_id=e.entity_id)`;
   const params=full?[userId]:[userId,JSON.stringify(keys)];
   const source=(await db.query(usageSQL({sql:full?"":` AND ${keySQL}`}),params)).rows;
-  const normalized=records(source,await lookups(db,userId));
+  const lookup=await lookups(db,userId);
+  const normalized=records(source,lookup);
   if(full) {
     // Transition tables are bounded too: one giant DELETE can make histogram
     // maintenance choose a very expensive plan during a historical rebuild.
@@ -70,10 +71,28 @@ export async function refreshUsage(db:PoolClient,userId:string,force=false,defer
         AND f.installation_id=t.installation_id AND f.kind=t.kind AND f.entity_id=t.entity_id`,[userId]);
       if(!removed.rowCount)break;
     }
-  } else await db.query(`DELETE FROM usage_facts e WHERE e.user_id=$1 AND ${keySQL}`,params);
+    for(;;) {
+      const removed=await db.query(`WITH targets AS (
+        SELECT installation_id,entity_id FROM transport_facts WHERE user_id=$1
+        ORDER BY installation_id,entity_id LIMIT 2000
+      ) DELETE FROM transport_facts f USING targets t WHERE f.user_id=$1
+        AND f.installation_id=t.installation_id AND f.entity_id=t.entity_id`,[userId]);
+      if(!removed.rowCount)break;
+    }
+  } else {
+    await db.query(`DELETE FROM usage_facts e WHERE e.user_id=$1 AND ${keySQL}`,params);
+    const attemptKeys=keys.filter((k:any)=>k.kind==="attempt");
+    if(attemptKeys.length) {
+      await db.query(`DELETE FROM transport_facts f USING jsonb_to_recordset($2::jsonb) p(installation_id uuid,entity_id text)
+        WHERE f.user_id=$1 AND f.installation_id=p.installation_id AND f.entity_id=p.entity_id`,[userId,JSON.stringify(attemptKeys)]);
+    }
+  }
   // A rebuild also repairs pre-existing aggregate drift, rather than subtracting
   // and re-adding facts on top of an already incorrect hourly row.
-  if(full)await db.query("DELETE FROM usage_hourly WHERE user_id=$1",[userId]);
+  if(full) {
+    await db.query("DELETE FROM usage_hourly WHERE user_id=$1",[userId]);
+    await db.query("DELETE FROM transport_hourly WHERE user_id=$1",[userId]);
+  }
   for(let start=0;start<source.length;start+=2000) {
     const batch=source.slice(start,start+2000).map((row,i)=>{
       const r=normalized[start+i]!,{installation,provider,model,model_id,machine,agent,status,historical,account_id,account_label,credential_id,credential_label,credential_kind,attribution}=r;
@@ -84,12 +103,55 @@ export async function refreshUsage(db:PoolClient,userId:string,force=false,defer
       SELECT $1,p.* FROM jsonb_to_recordset($2::jsonb) p(installation_id uuid,kind text,entity_id text,session_id text,observed_at bigint,dimensions jsonb,metrics numeric[],duration double precision,output double precision)
       ORDER BY installation_id,kind,entity_id`,[userId,JSON.stringify(batch)]);
   }
+  const attemptKeys=keys.filter((k:any)=>k.kind==="attempt");
+  if(full||attemptKeys.length) {
+    const attemptParams=full?[userId]:[userId,JSON.stringify(attemptKeys)];
+    const attemptFilter=full?"":` AND EXISTS(SELECT 1 FROM jsonb_to_recordset($2::jsonb) p(installation_id uuid,entity_id text) WHERE p.installation_id=e.installation_id AND p.entity_id=e.entity_id)`;
+    const attemptRows=(await db.query(`SELECT ${columns} FROM entities e WHERE e.user_id=$1 AND e.kind='attempt'${attemptFilter}`,attemptParams)).rows;
+    if(attemptRows.length) {
+      const completed=attemptRows.filter(row=>row.data.status==="completed"&&number(row.data.endedAt)!==null).map(row=>({installation_id:row.installation_id,session_id:row.session_id,message_id:row.message_id,entity_id:row.entity_id,provider:row.data.provider,model:row.data.model,account:row.data.account??null,window_from:Number(row.data.endedAt)-1000,window_to:Number(row.data.endedAt)+1000}));
+      if(completed.length) {
+        const candidates=(await db.query(`SELECT s.data,s.entity_id,s.installation_id,p.entity_id AS attempt_id FROM entities s
+          JOIN entities m ON m.user_id=s.user_id AND m.installation_id=s.installation_id AND m.kind='message' AND m.entity_id=s.message_id
+          JOIN jsonb_to_recordset($2::jsonb) AS p(installation_id uuid,session_id text,message_id text,entity_id text,provider text,model text,account text,window_from bigint,window_to bigint)
+          ON p.installation_id=s.installation_id AND p.session_id=s.session_id AND (p.message_id=s.message_id OR p.message_id=m.data->>'parentMessageId')
+          AND p.provider=s.data->>'provider' AND p.model=s.data->>'model'
+          AND (p.account IS NULL OR s.data->>'account' IS NULL OR p.account=s.data->>'account')
+          AND s.revision BETWEEN p.window_from AND p.window_to
+          WHERE s.user_id=$1 AND s.kind='step' AND NOT s.historical AND s.data->>'status'='completed'`,[userId,JSON.stringify(completed)])).rows;
+        const byAttempt=new Map<string,any[]>(),byStep=new Map<string,number>();
+        for(const candidate of candidates){const a=`${candidate.installation_id}:${candidate.attempt_id}`,s=`${candidate.installation_id}:${candidate.entity_id}`;if(!byAttempt.has(a))byAttempt.set(a,[]);byAttempt.get(a)!.push(candidate);byStep.set(s,(byStep.get(s)??0)+1);}
+        for(const row of attemptRows){
+          if(normalizeUsage(row.data).total_tokens!==null)continue;
+          const matches=byAttempt.get(`${row.installation_id}:${row.entity_id}`);if(matches?.length!==1)continue;
+          const step=matches[0];if(byStep.get(`${step.installation_id}:${step.entity_id}`)!==1||normalizeUsage(step.data).total_tokens===null)continue;
+          const usage=Object.fromEntries(["inputTokens","outputTokens","reasoningTokens","cacheReadTokens","cacheWriteTokens","totalTokens","usageSource","usageSemantics","outputSemantics","cost","costSource"].filter(key=>step.data[key]!==undefined&&(!["cost","costSource"].includes(key)||number(row.data.cost)===null)).map(key=>[key,step.data[key]]));
+          row.data={...row.data,...usage,usageProvenance:"lifecycle-correlated"};
+        }
+      }
+      const attemptNorm=records(attemptRows,lookup);
+      for(let start=0;start<attemptRows.length;start+=2000) {
+        const batch=attemptRows.slice(start,start+2000).map((row,i)=>{
+          const r=attemptNorm[start+i]!,{installation,provider,model,model_id,machine,agent,status,historical,account_id,account_label,credential_id,credential_label,credential_kind,attribution}=r;
+          const dimensions:UsageDimensions={installation,provider,model,model_id,machine,agent,status,historical,account_id,account_label,credential_id,credential_label,credential_kind,attribution,project:row.project_id??null};
+          const firstOutput=number(row.data.firstOutputMs),limit=number(row.data.contextLimit);
+          const ratio=r.prompt_tokens!==null&&limit&&limit>0?r.prompt_tokens/limit:null;
+          const bin=ratio===null?-1:ratio<0.25?0:ratio<0.5?1:ratio<0.75?2:ratio<0.9?3:4;
+          const metrics=[1,Number(r.status==="completed"),Number(r.status==="failed"),Number(r.status==="cancelled"),Number(r.status==="running"),Number(r.total_tokens!==null),Number(bin===0),Number(bin===1),Number(bin===2),Number(bin===3),Number(bin===4)];
+          return {installation_id:row.installation_id,entity_id:row.entity_id,session_id:row.session_id,observed_at:r.time,dimensions,metrics,first_output_ms:firstOutput,context_ratio:ratio,duration:r.duration};
+        });
+        await db.query(`INSERT INTO transport_facts(user_id,installation_id,entity_id,session_id,observed_at,dimensions,metrics,first_output_ms,context_ratio,duration)
+          SELECT $1,p.* FROM jsonb_to_recordset($2::jsonb) p(installation_id uuid,entity_id text,session_id text,observed_at bigint,dimensions jsonb,metrics numeric[],first_output_ms double precision,context_ratio double precision,duration double precision)
+          ORDER BY installation_id,entity_id`,[userId,JSON.stringify(batch)]);
+      }
+    }
+  }
   // A deferred refresh only carried the bounded dirty-key pass; the warranted
   // full rebuild stays pending so the background worker still runs it.
   if(deferred)return{deferred:true};
   await db.query(`INSERT INTO usage_rollup_state(user_id,ready,catalog_revision,format_version,updated_at)
-    VALUES($1,true,$2,2,now())
-    ON CONFLICT(user_id) DO UPDATE SET ready=true,catalog_revision=EXCLUDED.catalog_revision,format_version=2,updated_at=now()`,[userId,state.catalog_version]);
+    VALUES($1,true,$2,3,now())
+    ON CONFLICT(user_id) DO UPDATE SET ready=true,catalog_revision=EXCLUDED.catalog_revision,format_version=3,updated_at=now()`,[userId,state.catalog_version]);
 }
 
 function dimensionFilter(f:Filters,values:unknown[]) {
@@ -158,4 +220,82 @@ export async function usageBucketsReadOnly(db:PoolClient,userId:string,f:Filters
   const state=await usageState(db,userId);
   if(!state||state.ready!==true||state.current!==true||state.dirty===true)return null;
   return readUsageBuckets(db,userId,f);
+}
+
+export async function readTransportSummary(db:PoolClient,userId:string,f:Filters) {
+  const values:unknown[]=[userId],scope=dimensionFilter(f,values);
+  const bind=(value:unknown)=>{values.push(value);return `$${values.length}`;};
+  let exact="";
+  if(f.from!==undefined)exact+=` AND observed_at>=${bind(f.from)}`;
+  if(f.to!==undefined)exact+=` AND observed_at<${bind(f.to)}`;
+  if(f.sessionId)exact+=` AND session_id=${bind(f.sessionId)}`;
+  const rows:any[]=[];
+  if(f.sessionId) {
+    rows.push(...(await db.query(`SELECT metrics,first_output_ms,context_ratio,duration FROM transport_facts WHERE user_id=$1${scope}${exact}`,values)).rows);
+  } else {
+    const completeValues:unknown[]=[userId],completeScope=dimensionFilter(f,completeValues);
+    let complete="";
+    if(f.from!==undefined){completeValues.push(Math.ceil(f.from/hour)*hour);complete+=` AND hour>=$${completeValues.length}`;}
+    if(f.to!==undefined){completeValues.push(Math.floor(f.to/hour)*hour);complete+=` AND hour<$${completeValues.length}`;}
+    rows.push(...(await db.query(`SELECT metrics,histogram FROM transport_hourly WHERE user_id=$1${completeScope}${complete} AND metrics[1]>0`,completeValues)).rows);
+    const boundaries:string[]=[];
+    if(f.from!==undefined&&f.from%hour!==0)boundaries.push(`observed_at<${bind(Math.ceil(f.from/hour)*hour)}`);
+    if(f.to!==undefined&&f.to%hour!==0)boundaries.push(`observed_at>=${bind(Math.floor(f.to/hour)*hour)}`);
+    if(boundaries.length)rows.push(...(await db.query(`SELECT metrics,first_output_ms,context_ratio,duration FROM transport_facts WHERE user_id=$1${scope}${exact} AND (${boundaries.join(" OR ")})`,values)).rows);
+  }
+  let attempts=0,completed=0,failed=0,cancelled=0,running=0,known_usage=0;
+  const bins=[0,0,0,0,0],firstOutputs:number[]=[],ratios:number[]=[],durations:number[]=[];
+  for(const row of rows) {
+    const m=row.metrics.map(Number);
+    attempts+=m[0]!;completed+=m[1]!;failed+=m[2]!;cancelled+=m[3]!;running+=m[4]!;known_usage+=m[5]!;
+    for(let i=0;i<5;i++)bins[i]!+=m[6+i]!;
+    if(row.histogram) {
+      for(const [k,count]of Object.entries(row.histogram as Record<string,number>)) {
+        const target=k.startsWith("f:")?firstOutputs:k.startsWith("d:")?durations:ratios;
+        const val=k.startsWith("r:")?Number(k.slice(2))/100000:Number(k.slice(2));
+        for(let i=0;i<count;i++)target.push(val);
+      }
+    } else {
+      if(row.first_output_ms!==null&&row.first_output_ms!==undefined)firstOutputs.push(Number(row.first_output_ms));
+      if(row.context_ratio!==null&&row.context_ratio!==undefined)ratios.push(Number(row.context_ratio));
+      if(row.duration!==null&&row.duration!==undefined)durations.push(Number(row.duration));
+    }
+  }
+  firstOutputs.sort((a,b)=>a-b);ratios.sort((a,b)=>a-b);durations.sort((a,b)=>a-b);
+  const ranges=["0–25%","25–50%","50–75%","75–90%","90–100%+"];
+  return {
+    contextDistribution:ranges.map((range,i)=>({range,attempts:bins[i]!})).filter(x=>x.attempts>0),
+    contextPercentiles:{p50_ratio:percentile(ratios,.5),p95_ratio:percentile(ratios,.95)},
+    transport:{attempts,failed,cancelled,first_output_ms:percentile(firstOutputs,.5)},
+    attemptSummary:{attempts,completed,failed,cancelled,running,known_usage,first_output_ms:percentile(firstOutputs,.5),p50_ms:percentile(durations,.5),p95_ms:percentile(durations,.95)},
+  };
+}
+
+export async function sessionAggregatesFromRollup(db:PoolClient,userId:string,f:Filters) {
+  const state=await usageState(db,userId);
+  if(!state||state.ready!==true||state.current!==true)return null;
+  if(state.dirty)await refreshUsage(db,userId,false,true);
+  const values:unknown[]=[userId],scope=dimensionFilter(f,values);
+  const bind=(value:unknown)=>{values.push(value);return `$${values.length}`;};
+  let exact="";
+  if(f.from!==undefined)exact+=` AND observed_at>=${bind(f.from)}`;
+  if(f.to!==undefined)exact+=` AND observed_at<${bind(f.to)}`;
+  if(f.sessionId)exact+=` AND session_id=${bind(f.sessionId)}`;
+  const rows=(await db.query(`SELECT installation_id,session_id,
+    array_agg(DISTINCT dimensions->>'model') FILTER (WHERE dimensions->>'model' IS NOT NULL AND dimensions->>'model'<>'Unknown') AS models,
+    array_agg(DISTINCT dimensions->>'agent') FILTER (WHERE dimensions->>'agent' IS NOT NULL AND dimensions->>'agent'<>'Unknown') AS agents,
+    sum(metrics[1])::int AS calls,
+    sum(metrics[5])::int AS unknown_market_calls,
+    CASE WHEN sum(metrics[12])>0 THEN sum(metrics[11])::double precision ELSE NULL END AS input_tokens,
+    CASE WHEN sum(metrics[14])>0 THEN sum(metrics[13])::double precision ELSE NULL END AS output_tokens,
+    CASE WHEN sum(metrics[16])>0 THEN sum(metrics[15])::double precision ELSE NULL END AS reasoning_tokens,
+    CASE WHEN sum(metrics[18])>0 THEN sum(metrics[17])::double precision ELSE NULL END AS cache_read_tokens,
+    CASE WHEN sum(metrics[20])>0 THEN sum(metrics[19])::double precision ELSE NULL END AS cache_write_tokens,
+    CASE WHEN sum(metrics[26])>0 THEN sum(metrics[25])::double precision ELSE NULL END AS total_tokens,
+    CASE WHEN sum(metrics[28])>0 THEN sum(metrics[27])::double precision ELSE NULL END AS cost,
+    CASE WHEN sum(metrics[30])>0 THEN sum(metrics[29])::double precision ELSE NULL END AS market_cost,
+    CASE WHEN sum(metrics[9])>0 THEN (sum(metrics[10])/sum(metrics[9]))::double precision ELSE NULL END AS cache_reuse_ratio
+    FROM usage_facts WHERE user_id=$1 AND session_id IS NOT NULL${scope}${exact}
+    GROUP BY installation_id,session_id`,values)).rows;
+  return rows;
 }

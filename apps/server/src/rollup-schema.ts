@@ -39,11 +39,29 @@ export async function migrateRollups(db: PoolClient) {
       dimension_key bytea NOT NULL, dimensions jsonb NOT NULL, metrics numeric[] NOT NULL,
       histogram jsonb NOT NULL DEFAULT '{}', PRIMARY KEY(user_id,hour,dimension_key)
     );
+    CREATE TABLE IF NOT EXISTS transport_facts (
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, installation_id uuid NOT NULL,
+      entity_id text NOT NULL, session_id text, observed_at bigint NOT NULL,
+      dimensions jsonb NOT NULL, dimension_key bytea GENERATED ALWAYS AS (usage_dimension_key(dimensions)) STORED,
+      metrics numeric[] NOT NULL CHECK(cardinality(metrics)=11), first_output_ms double precision, context_ratio double precision, duration double precision,
+      PRIMARY KEY(user_id,installation_id,entity_id)
+    );
+    ALTER TABLE transport_facts ADD COLUMN IF NOT EXISTS duration double precision;
+    CREATE INDEX IF NOT EXISTS transport_facts_time ON transport_facts(user_id,observed_at);
+    CREATE TABLE IF NOT EXISTS transport_hourly (
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, hour bigint NOT NULL,
+      dimension_key bytea NOT NULL, dimensions jsonb NOT NULL, metrics numeric[] NOT NULL CHECK(cardinality(metrics)=11),
+      histogram jsonb NOT NULL DEFAULT '{}', PRIMARY KEY(user_id,hour,dimension_key)
+    );
     CREATE INDEX IF NOT EXISTS entities_attempt_message ON entities(user_id,installation_id,message_id) WHERE kind='attempt';
 
     CREATE OR REPLACE FUNCTION usage_metrics_add(a numeric[],b numeric[]) RETURNS numeric[]
     LANGUAGE sql IMMUTABLE STRICT AS $$
       SELECT ARRAY(SELECT a[i]+b[i] FROM generate_series(1,34) AS i)
+    $$;
+    CREATE OR REPLACE FUNCTION transport_metrics_add(a numeric[],b numeric[]) RETURNS numeric[]
+    LANGUAGE sql IMMUTABLE STRICT AS $$
+      SELECT ARRAY(SELECT a[i]+b[i] FROM generate_series(1,11) AS i)
     $$;
     CREATE OR REPLACE FUNCTION usage_histogram_add(a jsonb,b jsonb) RETURNS jsonb
     LANGUAGE sql IMMUTABLE STRICT AS $$
@@ -93,12 +111,57 @@ export async function migrateRollups(db: PoolClient) {
       ) changed WHERE h.user_id=changed.user_id AND h.hour=changed.hour AND h.dimension_key=changed.dimension_key AND h.metrics[1]=0';
       RETURN NULL;
     END $$;
+    CREATE OR REPLACE FUNCTION transport_apply_hourly() RETURNS trigger LANGUAGE plpgsql SET jit=off AS $$
+    DECLARE source text;
+    BEGIN
+      source := CASE TG_OP
+        WHEN 'INSERT' THEN 'SELECT *,1::numeric AS sign FROM added'
+        WHEN 'DELETE' THEN 'SELECT *,-1::numeric AS sign FROM removed'
+        ELSE 'SELECT *,1::numeric AS sign FROM added UNION ALL SELECT *,-1::numeric AS sign FROM removed' END;
+      EXECUTE 'WITH changes AS MATERIALIZED (
+        SELECT c.*,floor(c.observed_at::numeric/3600000)::bigint*3600000 AS hour
+        FROM ('||source||') c WHERE EXISTS(SELECT 1 FROM users u WHERE u.id=c.user_id)
+      ), dimensions AS (
+        SELECT DISTINCT ON(user_id,hour,dimension_key) user_id,hour,dimension_key,dimensions FROM changes
+      ), numbers AS (
+        SELECT user_id,hour,dimension_key,array_agg(n ORDER BY ordinal) AS metrics FROM (
+          SELECT user_id,hour,dimension_key,v.ordinal,sum(v.value*c.sign) AS n
+          FROM changes c CROSS JOIN LATERAL unnest(c.metrics) WITH ORDINALITY v(value,ordinal)
+          GROUP BY user_id,hour,dimension_key,v.ordinal
+        ) s GROUP BY user_id,hour,dimension_key
+      ), histograms AS (
+        SELECT user_id,hour,dimension_key,jsonb_object_agg(label,n) AS histogram FROM (
+          SELECT user_id,hour,dimension_key,v.label,sum(c.sign) AS n FROM changes c
+          CROSS JOIN LATERAL (VALUES
+            (CASE WHEN c.first_output_ms IS NOT NULL THEN ''f:''||round(c.first_output_ms)::bigint::text END),
+            (CASE WHEN c.context_ratio IS NOT NULL THEN ''r:''||round(c.context_ratio*100000)::bigint::text END),
+            (CASE WHEN c.duration IS NOT NULL THEN ''d:''||c.duration::text END)
+          ) v(label) WHERE v.label IS NOT NULL
+          GROUP BY user_id,hour,dimension_key,v.label HAVING sum(c.sign)<>0
+        ) s GROUP BY user_id,hour,dimension_key
+      ) INSERT INTO transport_hourly AS h(user_id,hour,dimension_key,dimensions,metrics,histogram)
+      SELECT d.user_id,d.hour,d.dimension_key,d.dimensions,n.metrics,COALESCE(g.histogram,''{}'')
+      FROM dimensions d JOIN numbers n USING(user_id,hour,dimension_key)
+      LEFT JOIN histograms g USING(user_id,hour,dimension_key)
+      ORDER BY d.user_id,d.hour,d.dimension_key
+      ON CONFLICT(user_id,hour,dimension_key) DO UPDATE SET
+        metrics=transport_metrics_add(h.metrics,EXCLUDED.metrics),
+        histogram=usage_histogram_add(h.histogram,EXCLUDED.histogram)';
+      EXECUTE 'DELETE FROM transport_hourly h USING (
+        SELECT DISTINCT user_id,floor(observed_at::numeric/3600000)::bigint*3600000 AS hour,dimension_key FROM ('||source||') c
+      ) changed WHERE h.user_id=changed.user_id AND h.hour=changed.hour AND h.dimension_key=changed.dimension_key AND h.metrics[1]=0';
+      RETURN NULL;
+    END $$;
     CREATE OR REPLACE FUNCTION usage_mark_identity(uid uuid,iid uuid,k text,eid text,mid text,parent text) RETURNS void LANGUAGE plpgsql AS $$
     BEGIN
       IF k NOT IN ('step','message','attempt') OR NOT EXISTS(SELECT 1 FROM users WHERE id=uid) THEN RETURN; END IF;
       INSERT INTO usage_dirty VALUES(uid,iid,k,eid) ON CONFLICT DO NOTHING;
       IF k='step' AND mid IS NOT NULL THEN
         INSERT INTO usage_dirty VALUES(uid,iid,'message',mid) ON CONFLICT DO NOTHING;
+        INSERT INTO usage_dirty SELECT user_id,installation_id,kind,entity_id FROM entities
+        WHERE user_id=uid AND installation_id=iid AND kind='attempt' AND (message_id=mid OR message_id=(
+          SELECT parent_message_id FROM entities WHERE user_id=uid AND installation_id=iid AND kind='message' AND entity_id=mid
+        )) ON CONFLICT DO NOTHING;
       END IF;
       IF k='message' AND parent IS NOT NULL THEN
         INSERT INTO usage_dirty SELECT user_id,installation_id,kind,entity_id FROM entities
@@ -134,6 +197,11 @@ export async function migrateRollups(db: PoolClient) {
         CREATE TRIGGER usage_price_rules AFTER INSERT OR UPDATE OR DELETE ON prices FOR EACH ROW EXECUTE FUNCTION usage_invalidate_rules();
         CREATE TRIGGER usage_account_rules AFTER INSERT OR UPDATE OR DELETE ON account_assignments FOR EACH ROW EXECUTE FUNCTION usage_invalidate_rules();
         CREATE TRIGGER usage_catalog_rules AFTER INSERT OR UPDATE OR DELETE ON market_rates FOR EACH ROW EXECUTE FUNCTION usage_invalidate_catalog();
+      END IF;
+      IF NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='transport_facts'::regclass AND tgname='transport_insert_hourly') THEN
+        CREATE TRIGGER transport_insert_hourly AFTER INSERT ON transport_facts REFERENCING NEW TABLE AS added FOR EACH STATEMENT EXECUTE FUNCTION transport_apply_hourly();
+        CREATE TRIGGER transport_update_hourly AFTER UPDATE ON transport_facts REFERENCING OLD TABLE AS removed NEW TABLE AS added FOR EACH STATEMENT EXECUTE FUNCTION transport_apply_hourly();
+        CREATE TRIGGER transport_delete_hourly AFTER DELETE ON transport_facts REFERENCING OLD TABLE AS removed FOR EACH STATEMENT EXECUTE FUNCTION transport_apply_hourly();
       END IF;
     END $$;
   `);

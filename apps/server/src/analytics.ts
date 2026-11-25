@@ -3,7 +3,7 @@ import { tenant } from "./db.js";
 import { cached } from "./cache.js";
 import { Aggregate, normalizeUsage, number, chooseBucket, bucketTime, nextBucket, percentile, outputHistogram, type UsageRecord } from "./metrics.js";
 import { where, columns, usageSQL, lookups, records, identityMatches } from "./usage.js";
-import { usageBuckets } from "./rollups.js";
+import { usageBuckets, readTransportSummary, sessionAggregatesFromRollup } from "./rollups.js";
 import { bucketAnalytics } from "./bucket-analytics.js";
 
 function dataKey(f: Filters) { const { groupBy, sortBy, sortDir, limit, offset, ...scope } = f; return JSON.stringify(scope); }
@@ -102,12 +102,14 @@ export async function analyticsLegacy(userId: string, query: unknown, observer?:
 export async function analytics(userId:string,query:unknown,observer?:AnalyticsObserver) {
   const f=FilterSchema.parse(query);
   return cached(userId,`hourlyAnalytics:${f.groupBy}:${dataKey(f)}`,async()=>{
-    const loaded=await profileLoad(observer,"hourly buckets + exact boundaries",()=>tenant(userId,db=>usageBuckets(db,userId,f)),value=>value.buckets.length);
+    const {loaded,transport}=await tenant(userId,async db=>{
+      const loaded=await profileLoad(observer,"hourly buckets + exact boundaries",()=>usageBuckets(db,userId,f),value=>value.buckets.length);
+      const transport=await profileLoad(observer,"transport rollup",()=>readTransportSummary(db,userId,f),value=>value.transport.attempts);
+      return {loaded,transport};
+    });
     const to=f.to??Date.now(),from=f.from??loaded.earliest??to-7*86400000;
     const usage=profile(observer,"bucket totals + breakdowns + charts",loaded.buckets.length,()=>bucketAnalytics(loaded.buckets,from,to,f.groupBy),value=>value.summary.calls);
-    const attempts=await profileLoad(observer,"attempt facts: load + correlate + normalize",()=>attemptFacts(userId,f,observer),value=>value.records.length);
-    const transport=profile(observer,"transport + context statistics",attempts.rows.length,()=>transportStats(attempts.rows,attempts.records),value=>value.contextDistribution.length+2);
-    return {...usage,...transport,notes:["Recorded costs are provider-reported amounts or OpenCode estimates, not invoices. Market value excludes subscription fees.","Totals normalize cache and reasoning overlap; partial measurements remain unavailable.","Reuse is token-weighted provider-reported cache reuse, not a comparison of prompt contents.","Unassigned historical accounts and keys are not inferred from provider names."]};
+    return {...usage,contextDistribution:transport.contextDistribution,contextPercentiles:transport.contextPercentiles,transport:transport.transport,notes:["Recorded costs are provider-reported amounts or OpenCode estimates, not invoices. Market value excludes subscription fees.","Totals normalize cache and reasoning overlap; partial measurements remain unavailable.","Reuse is token-weighted provider-reported cache reuse, not a comparison of prompt contents.","Unassigned historical accounts and keys are not inferred from provider names."]};
   });
 }
 export const sortExpressions: Record<string, string> = {
@@ -128,27 +130,52 @@ function sortRows<T>(rows: T[], f: Filters, accessor: (r: T) => any) {
 async function entityPage(userId: string, kind: string, query: unknown) {
   const f = FilterSchema.parse(query);
   if (kind === "session") {
-    const { records: rs } = await facts(userId, { ...f, status: undefined });
+    const w = where({ ...f, provider: undefined, model: undefined, account: undefined, credential: undefined, status: undefined });
+    const [rollupSessions, sessions] = await tenant(userId, async db => {
+      const rollup = await sessionAggregatesFromRollup(db, userId, { ...f, status: undefined });
+      const rows = (await db.query(`SELECT e.* FROM entities e WHERE e.user_id=$1 AND e.kind='session' ${w.sql}`, [userId, ...w.values])).rows;
+      return [rollup, rows] as const;
+    });
+    const rollupMap = new Map<string, any>();
     const aggregates = new Map<string, Aggregate>();
     const sessionModels = new Map<string, Set<string>>();
     const sessionAgents = new Map<string, Set<string>>();
-    for (const r of rs) if (r.session) {
-      const key = `${r.installation}:${r.session}`;
-      if (!aggregates.has(key)) aggregates.set(key, new Aggregate());
-      aggregates.get(key)!.add(r);
-      if (r.model && r.model !== "Unknown") {
-        if (!sessionModels.has(key)) sessionModels.set(key, new Set());
-        sessionModels.get(key)!.add(r.model);
+    if (rollupSessions) {
+      for (const r of rollupSessions) {
+        const key = `${r.installation_id}:${r.session_id}`;
+        rollupMap.set(key, {
+          inputTokens: r.input_tokens, outputTokens: r.output_tokens, reasoningTokens: r.reasoning_tokens,
+          cacheReadTokens: r.cache_read_tokens, cacheWriteTokens: r.cache_write_tokens,
+          totalTokens: r.total_tokens, cost: r.cost, marketCost: r.market_cost,
+          cacheReuseRatio: r.cache_reuse_ratio, calls: r.calls, unknownMarketCalls: r.unknown_market_calls,
+          models: r.models ?? [], agents: r.agents ?? [],
+        });
       }
-      if (r.agent && r.agent !== "Unknown") {
-        if (!sessionAgents.has(key)) sessionAgents.set(key, new Set());
-        sessionAgents.get(key)!.add(r.agent);
+    } else {
+      const { records: rs } = await facts(userId, { ...f, status: undefined });
+      for (const r of rs) if (r.session) {
+        const key = `${r.installation}:${r.session}`;
+        if (!aggregates.has(key)) aggregates.set(key, new Aggregate());
+        aggregates.get(key)!.add(r);
+        if (r.model && r.model !== "Unknown") {
+          if (!sessionModels.has(key)) sessionModels.set(key, new Set());
+          sessionModels.get(key)!.add(r.model);
+        }
+        if (r.agent && r.agent !== "Unknown") {
+          if (!sessionAgents.has(key)) sessionAgents.set(key, new Set());
+          sessionAgents.get(key)!.add(r.agent);
+        }
       }
     }
-    const w = where({ ...f, provider: undefined, model: undefined, account: undefined, credential: undefined, status: undefined });
-    const sessions = await tenant(userId, async db => (await db.query(`SELECT e.* FROM entities e WHERE e.user_id=$1 AND e.kind='session' ${w.sql}`, [userId, ...w.values])).rows);
-    const filtered = sessions.filter(row => !(f.provider || f.model || f.account || f.credential) || aggregates.has(`${row.installation_id}:${row.entity_id}`)).map(row => {
+    const filtered = sessions.filter(row => !(f.provider || f.model || f.account || f.credential) || (rollupSessions ? rollupMap.has(`${row.installation_id}:${row.entity_id}`) : aggregates.has(`${row.installation_id}:${row.entity_id}`))).map(row => {
       const key = `${row.installation_id}:${row.entity_id}`;
+      if (rollupSessions) {
+        const r = rollupMap.get(key);
+        const distinctModels = r?.models?.length ? r.models : (row.data.model ? [row.data.model] : []);
+        const distinctAgents = r?.agents?.length ? r.agents : (row.data.agent ? [row.data.agent] : []);
+        const { models: _m, agents: _a, ...metrics } = r ?? { totalTokens: normalizeUsage(row.data).total_tokens };
+        return { ...row, data: { ...row.data, ...metrics, models: distinctModels, agents: distinctAgents } };
+      }
       const aggregate = aggregates.get(key)?.finish();
       const distinctModels = sessionModels.has(key) ? [...sessionModels.get(key)!] : (row.data.model ? [row.data.model] : []);
       const distinctAgents = sessionAgents.has(key) ? [...sessionAgents.get(key)!] : (row.data.agent ? [row.data.agent] : []);
@@ -262,25 +289,58 @@ async function attemptFacts(userId:string,f:Filters,observer?:AnalyticsObserver)
 export async function listEntities(userId:string,kind:string,query:unknown) {
   const page=await entityPage(userId,kind,query);
   if(kind!=="attempt")return page;
-  const f=FilterSchema.parse(query),{records:rs,rows,lookup}=await attemptFacts(userId,f);
-  // Enrichment is read-only and does not replace stored transport measurements.
-  const enriched=new Map(rows.map(row=>[`${row.installation_id}:${row.entity_id}`,row.data]));
-  const items=page.items.map((row:any)=>({...row,data:{...row.data,...enriched.get(`${row.installation_id}:${row.entity_id}`)}}));
-  const normalized=records(items,lookup);items.forEach((row:any,i:number)=>{row.data.totalTokens=normalized[i]!.total_tokens;row.data.marketCost=normalized[i]!.market_cost;});
-  if(["inputTokens","outputTokens","totalTokens","cost","marketCost"].includes(f.sortBy)&&rows.some(row=>row.data.usageProvenance)){
-    const selectedRows=rows.filter(row=>identityMatches(records([row],lookup)[0]!,f));
-    const values=records(selectedRows,lookup);const byId=new Map(values.map(r=>[`${r.installation}:${r.id}`,r]));
-    const sorted=sortRows(selectedRows,f,row=>{const r=byId.get(`${row.installation_id}:${row.entity_id}`)!;return f.sortBy==="totalTokens"?r.total_tokens:f.sortBy==="marketCost"?r.market_cost:row.data[f.sortBy];});
-    const ids=sorted.slice(f.offset,f.offset+f.limit);
-    const full=await tenant(userId,async db=>(await db.query(`SELECT e.* FROM entities e JOIN jsonb_to_recordset($3::jsonb) AS p(installation_id uuid,entity_id text) ON e.installation_id=p.installation_id AND e.entity_id=p.entity_id WHERE e.user_id=$1 AND e.kind=$2`,[userId,kind,JSON.stringify(ids.map(row=>({installation_id:row.installation_id,entity_id:row.entity_id})))] )).rows);
-    const indexed=new Map(full.map(row=>[`${row.installation_id}:${row.entity_id}`,row]));
-    items.splice(0,items.length,...ids.map(row=>{const r=byId.get(`${row.installation_id}:${row.entity_id}`)!;return {...indexed.get(`${row.installation_id}:${row.entity_id}`),data:{...row.data,totalTokens:r.total_tokens,marketCost:r.market_cost}};}));
+  const f=FilterSchema.parse(query);
+  if(["inputTokens","outputTokens","totalTokens","cost","marketCost"].includes(f.sortBy)) {
+    const {records:rs,rows,lookup}=await attemptFacts(userId,f);
+    // Enrichment is read-only and does not replace stored transport measurements.
+    const enriched=new Map(rows.map(row=>[`${row.installation_id}:${row.entity_id}`,row.data]));
+    const items=page.items.map((row:any)=>({...row,data:{...row.data,...enriched.get(`${row.installation_id}:${row.entity_id}`)}}));
+    const normalized=records(items,lookup);items.forEach((row:any,i:number)=>{row.data.totalTokens=normalized[i]!.total_tokens;row.data.marketCost=normalized[i]!.market_cost;});
+    if(rows.some(row=>row.data.usageProvenance)){
+      const selectedRows=rows.filter(row=>identityMatches(records([row],lookup)[0]!,f));
+      const values=records(selectedRows,lookup);const byId=new Map(values.map(r=>[`${r.installation}:${r.id}`,r]));
+      const sorted=sortRows(selectedRows,f,row=>{const r=byId.get(`${row.installation_id}:${row.entity_id}`)!;return f.sortBy==="totalTokens"?r.total_tokens:f.sortBy==="marketCost"?r.market_cost:row.data[f.sortBy];});
+      const ids=sorted.slice(f.offset,f.offset+f.limit);
+      const full=await tenant(userId,async db=>(await db.query(`SELECT e.* FROM entities e JOIN jsonb_to_recordset($3::jsonb) AS p(installation_id uuid,entity_id text) ON e.installation_id=p.installation_id AND e.entity_id=p.entity_id WHERE e.user_id=$1 AND e.kind=$2`,[userId,kind,JSON.stringify(ids.map(row=>({installation_id:row.installation_id,entity_id:row.entity_id})))] )).rows);
+      const indexed=new Map(full.map(row=>[`${row.installation_id}:${row.entity_id}`,row]));
+      items.splice(0,items.length,...ids.map(row=>{const r=byId.get(`${row.installation_id}:${row.entity_id}`)!;return {...indexed.get(`${row.installation_id}:${row.entity_id}`),data:{...row.data,totalTokens:r.total_tokens,marketCost:r.market_cost}};}));
+    }
+    const selected=new Set(rs.map(r=>`${r.installation}:${r.id}`)),aggregate=new Aggregate(),first:number[]=[];
+    for(const r of rs)aggregate.add(r,true);
+    for(const row of rows)if(selected.has(`${row.installation_id}:${row.entity_id}`)){const value=number(row.data.firstOutputMs);if(value!==null)first.push(value);}
+    first.sort((a,b)=>a-b);
+    return {...page,items,summary:{...aggregate.finish(true),attempts:rs.length,completed:rs.filter(r=>r.status==="completed").length,failed:rs.filter(r=>r.status==="failed").length,cancelled:rs.filter(r=>r.status==="cancelled").length,running:rs.filter(r=>r.status==="running").length,known_usage:rs.filter(r=>r.total_tokens!==null).length,first_output_ms:percentile(first,.5)}};
   }
-  const selected=new Set(rs.map(r=>`${r.installation}:${r.id}`)),aggregate=new Aggregate(),first:number[]=[];
-  for(const r of rs)aggregate.add(r,true);
-  for(const row of rows)if(selected.has(`${row.installation_id}:${row.entity_id}`)){const value=number(row.data.firstOutputMs);if(value!==null)first.push(value);}
-  first.sort((a,b)=>a-b);
-  return {...page,items,summary:{...aggregate.finish(true),attempts:rs.length,completed:rs.filter(r=>r.status==="completed").length,failed:rs.filter(r=>r.status==="failed").length,cancelled:rs.filter(r=>r.status==="cancelled").length,running:rs.filter(r=>r.status==="running").length,known_usage:rs.filter(r=>r.total_tokens!==null).length,first_output_ms:percentile(first,.5)}};
+  const items=page.items.map((row:any)=>({...row,data:{...row.data}}));
+  const completed=items.filter(row=>row.data.status==="completed"&&number(row.data.endedAt)!==null).map(row=>({installation_id:row.installation_id,session_id:row.session_id,message_id:row.message_id,entity_id:row.entity_id,provider:row.data.provider,model:row.data.model,account:row.data.account??null,window_from:Number(row.data.endedAt)-1000,window_to:Number(row.data.endedAt)+1000}));
+  const {lookup,transport}=await tenant(userId,async db=>{
+    await db.query("SET LOCAL jit=off");
+    const lookup=await lookups(db,userId);
+    if(completed.length){
+      const candidates=(await db.query(`SELECT s.data,s.entity_id,s.installation_id,p.entity_id AS attempt_id FROM entities s
+        JOIN entities m ON m.user_id=s.user_id AND m.installation_id=s.installation_id AND m.kind='message' AND m.entity_id=s.message_id
+        JOIN jsonb_to_recordset($2::jsonb) AS p(installation_id uuid,session_id text,message_id text,entity_id text,provider text,model text,account text,window_from bigint,window_to bigint)
+        ON p.installation_id=s.installation_id AND p.session_id=s.session_id AND (p.message_id=s.message_id OR p.message_id=m.data->>'parentMessageId')
+        AND p.provider=s.data->>'provider' AND p.model=s.data->>'model'
+        AND (p.account IS NULL OR s.data->>'account' IS NULL OR p.account=s.data->>'account')
+        AND s.revision BETWEEN p.window_from AND p.window_to
+        WHERE s.user_id=$1 AND s.kind='step' AND NOT s.historical AND s.data->>'status'='completed'`,[userId,JSON.stringify(completed)])).rows;
+      const byAttempt=new Map<string,any[]>(),byStep=new Map<string,number>();
+      for(const candidate of candidates){const a=`${candidate.installation_id}:${candidate.attempt_id}`,s=`${candidate.installation_id}:${candidate.entity_id}`;if(!byAttempt.has(a))byAttempt.set(a,[]);byAttempt.get(a)!.push(candidate);byStep.set(s,(byStep.get(s)??0)+1);}
+      for(const row of items){
+        if(normalizeUsage(row.data).total_tokens!==null)continue;
+        const matches=byAttempt.get(`${row.installation_id}:${row.entity_id}`);if(matches?.length!==1)continue;
+        const step=matches[0];if(byStep.get(`${step.installation_id}:${step.entity_id}`)!==1||normalizeUsage(step.data).total_tokens===null)continue;
+        const usage=Object.fromEntries(["inputTokens","outputTokens","reasoningTokens","cacheReadTokens","cacheWriteTokens","totalTokens","usageSource","usageSemantics","outputSemantics","cost","costSource"].filter(key=>step.data[key]!==undefined&&(!["cost","costSource"].includes(key)||number(row.data.cost)===null)).map(key=>[key,step.data[key]]));
+        row.data={...row.data,...usage,usageProvenance:"lifecycle-correlated"};
+      }
+    }
+    await usageBuckets(db,userId,f);
+    const transport=await readTransportSummary(db,userId,f);
+    return {lookup,transport};
+  });
+  const normalized=records(items,lookup);items.forEach((row:any,i:number)=>{row.data.totalTokens=normalized[i]!.total_tokens;row.data.marketCost=normalized[i]!.market_cost;});
+  return {...page,items,summary:transport.attemptSummary};
 }
 export async function dimensions(userId: string) {
   return cached(userId, "dimensions", () => tenant(userId, async db => {

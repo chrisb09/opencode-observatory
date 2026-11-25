@@ -223,7 +223,7 @@ export async function migrate() {
     `);
     await migrateRollups(db);
     await migrateMemory(db);
-    for (const table of ["entities", "events", "account_aliases", "prices", "account_assignments", "usage_facts", "usage_hourly", "usage_dirty", "usage_rollup_state", "session_contents", "media_assets", "summaries", "vault_concepts", "vault_claims", "vault_edges", "vault_conflicts", "vault_jobs", "librarian_decisions"]) {
+    for (const table of ["entities", "events", "account_aliases", "prices", "account_assignments", "usage_facts", "usage_hourly", "transport_facts", "transport_hourly", "usage_dirty", "usage_rollup_state", "session_contents", "media_assets", "summaries", "vault_concepts", "vault_claims", "vault_edges", "vault_conflicts", "vault_jobs", "librarian_decisions"]) {
       await db.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
       await db.query(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`);
       await db.query(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='${table}' AND policyname='tenant_isolation') THEN
